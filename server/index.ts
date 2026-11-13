@@ -23,6 +23,7 @@ async function bootstrap(): Promise<void> {
     const mem = process.memoryUsage();
     res.json({
       ok: true,
+      runtimeTag: 'node24-slim-v2',
       dbPath: store.dbPath,
       dhanStatus: engine.getDhanStatus(),
       uptimeSec: Math.round(process.uptime()),
@@ -67,12 +68,23 @@ async function bootstrap(): Promise<void> {
 
   app.post('/api/dhan/connect', async (req, res) => {
     try {
-      const { clientId, accessToken } = (req.body || {}) as {
+      const { clientId, accessToken, transport } = (req.body || {}) as {
         clientId?: string;
         accessToken?: string;
+        transport?: 'AUTO' | 'REST';
       };
-      const status = await engine.connectDhanLive(clientId, accessToken);
-      res.json({ ok: true, dhanStatus: status });
+      const safeTransport = transport === 'REST' || transport === 'AUTO' ? transport : undefined;
+      const status = await engine.connectDhanLive(clientId, accessToken, safeTransport);
+      const mem = process.memoryUsage();
+      res.json({
+        ok: true,
+        dhanStatus: status,
+        memoryMb: {
+          rss: Math.round(mem.rss / 1048576),
+          heapUsed: Math.round(mem.heapUsed / 1048576),
+          external: Math.round(mem.external / 1048576),
+        },
+      });
     } catch (err) {
       res.status(400).json({
         ok: false,

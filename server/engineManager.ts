@@ -704,7 +704,11 @@ export class EngineManager extends EventEmitter {
     this.store.upsertCandles5s(key, this.configs[key].symbol, enriched, 'SIMULATOR');
   }
 
-  public async connectDhanLive(clientId?: string, accessToken?: string): Promise<DhanStatus> {
+  public async connectDhanLive(
+    clientId?: string,
+    accessToken?: string,
+    transport?: 'AUTO' | 'REST'
+  ): Promise<DhanStatus> {
     if (clientId && accessToken) {
       this.dhan.setCredentials(clientId, accessToken);
     }
@@ -729,7 +733,7 @@ export class EngineManager extends EventEmitter {
       await this.warmStreamHistoryFromDhan(ALL_KEYS);
 
       const subList = this.getActiveSubscriptions();
-      this.dhan.connect(subList);
+      this.dhan.connect(subList, transport);
       this.recomputeAllSnapshots();
       this.lastLiveFlushMs = Date.now();
       this.emit('broadcast', this.getFullBroadcast('FULL_STATE'));

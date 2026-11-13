@@ -629,7 +629,7 @@ export class DhanClient extends EventEmitter {
     }
   }
 
-  public connect(instruments: SubscribedInstrument[]): void {
+  public connect(instruments: SubscribedInstrument[], transport?: 'AUTO' | 'REST'): void {
     if (!this.credentials) {
       this.lastError = 'Dhan credentials missing';
       return;
@@ -641,7 +641,10 @@ export class DhanClient extends EventEmitter {
     this.wsFailureCount = 0;
     this.prevCloseCache.clear();
 
-    if (process.env.DHAN_TRANSPORT?.toUpperCase() === 'REST') {
+    const useRest =
+      transport === 'REST' ||
+      (transport !== 'AUTO' && process.env.DHAN_TRANSPORT?.toUpperCase() === 'REST');
+    if (useRest) {
       this.startRestQuotePolling();
       return;
     }
@@ -724,13 +727,21 @@ export class DhanClient extends EventEmitter {
       this.startRestQuotePolling();
     });
 
-    ws.on('message', (data: WebSocket.RawData) => {
+    ws.on('message', (data: WebSocket.RawData, isBinary: boolean) => {
       try {
         const buf = Buffer.isBuffer(data)
           ? data
           : Array.isArray(data)
             ? Buffer.concat(data)
             : Buffer.from(data);
+        if (!isBinary) {
+          const text = buf.toString('utf8').trim();
+          if (text) {
+            this.lastError = `Dhan WS text: ${text.slice(0, 140)}`;
+            this.emit('status');
+          }
+          return;
+        }
         this.parseBinaryPacket(buf);
       } catch (err) {
         this.lastError = `WS packet decode warning: ${err instanceof Error ? err.message : String(err)}`;
