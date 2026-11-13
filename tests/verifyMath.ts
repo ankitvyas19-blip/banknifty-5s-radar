@@ -524,3 +524,50 @@ console.log('✓ Test 10 passed: Net-of-Tax Strategy Backtester:', {
   naiveNetRs: stratSummary.comparison?.naiveNetRs,
 });
 
+// 11. Verify DhanHQ binary WS parser resilience (NaN/0/truncated frames, multi-packet concat, PrevClose dedup)
+const guardClient = new DhanClient();
+const parser = (guardClient as unknown as { parseBinaryPacket: (b: Buffer) => void }).parseBinaryPacket.bind(guardClient);
+let guardTicks = 0;
+let guardPrevCloses = 0;
+guardClient.on('tick', () => {
+  guardTicks++;
+});
+guardClient.on('prevClose', () => {
+  guardPrevCloses++;
+});
+
+// 11a. Truncated & invalid length packets must not throw
+parser(Buffer.alloc(3));
+const badLen = Buffer.alloc(16);
+badLen.writeUInt8(4, 0);
+badLen.writeInt16LE(2, 1);
+parser(badLen);
+
+// 11b. NaN / zero / negative / astronomical float32 LTPs must be ignored
+const nanPkt = Buffer.alloc(16);
+nanPkt.writeUInt8(2, 0);
+nanPkt.writeInt16LE(16, 1);
+nanPkt.writeUInt8(0, 3);
+nanPkt.writeInt32LE(25, 4);
+nanPkt.writeFloatLE(Number.NaN, 8);
+nanPkt.writeInt32LE(1794580380, 12);
+parser(nanPkt);
+
+const zeroPkt = Buffer.from(nanPkt);
+zeroPkt.writeFloatLE(0, 8);
+parser(zeroPkt);
+assert.equal(guardTicks, 0, 'Invalid NaN/0 LTP binary packets must not emit ticks');
+
+// 11c. Concatenated PrevClose (16B) + Quote (50B) in a single WS frame + duplicate PrevClose suppression
+const prevPkt = Buffer.alloc(16);
+prevPkt.writeUInt8(6, 0);
+prevPkt.writeInt16LE(16, 1);
+prevPkt.writeUInt8(0, 3);
+prevPkt.writeInt32LE(25, 4);
+prevPkt.writeFloatLE(61450.25, 8);
+
+const combinedFrame = Buffer.concat([prevPkt, prevPkt, packet]);
+parser(combinedFrame);
+assert.equal(guardPrevCloses, 1, 'Duplicate PrevClose in WS stream must be deduplicated');
+assert.equal(guardTicks, 1, 'Valid Quote packet after PrevClose must still decode');
+console.log('✓ Test 11 passed: Binary WS guard (NaN/truncated ignored, multi-packet + PrevClose dedup).');

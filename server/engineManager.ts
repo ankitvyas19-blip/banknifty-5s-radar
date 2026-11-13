@@ -82,6 +82,8 @@ export class EngineManager extends EventEmitter {
   };
 
   private simTimer: NodeJS.Timeout | null = null;
+  private liveFlushTimer: NodeJS.Timeout | null = null;
+  private lastLiveFlushMs = 0;
   private lastClockMs: number = Date.now();
   private connectPromise: Promise<DhanStatus> | null = null;
 
@@ -134,7 +136,7 @@ export class EngineManager extends EventEmitter {
     this.dhan.on('ticks', (ticks: DhanTickEvent[]) => this.handleDhanTickBatch(ticks));
     this.dhan.on('prevClose', (ev: { securityId: string; prevClose: number }) => {
       for (const key of ALL_KEYS) {
-        if (this.configs[key].securityId === ev.securityId && ev.prevClose > 0) {
+        if (this.configs[key].securityId === ev.securityId && Number.isFinite(ev.prevClose) && ev.prevClose > 0) {
           this.prevCloses[key] = ev.prevClose;
         }
       }
@@ -314,6 +316,9 @@ export class EngineManager extends EventEmitter {
   }
 
   private ingestTick(key: StreamKey, price: number, volumeDelta: number, timestampMs: number): void {
+    if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(timestampMs)) return;
+    const safeVol = Number.isFinite(volumeDelta) && volumeDelta >= 0 ? volumeDelta : 0;
+
     const sec = Math.floor(timestampMs / 1000);
     const bar5sTime = Math.floor(sec / 5) * 5;
     const arr = this.candles5s[key];
@@ -329,8 +334,12 @@ export class EngineManager extends EventEmitter {
           this.lastEvaluated1mSec[key] = prevMin;
         }
         if (last.time > this.lastPersisted5sTime[key]) {
-          this.store.upsertCandles5s(key, this.configs[key].symbol, [last], this.mode);
-          this.lastPersisted5sTime[key] = last.time;
+          try {
+            this.store.upsertCandles5s(key, this.configs[key].symbol, [last], this.mode);
+            this.lastPersisted5sTime[key] = last.time;
+          } catch (err) {
+            console.error('[BankNifty 5s Radar] SQLite candle persist error:', err);
+          }
         }
       }
 
@@ -340,7 +349,7 @@ export class EngineManager extends EventEmitter {
         high: price,
         low: price,
         close: price,
-        volume: volumeDelta,
+        volume: safeVol,
       });
 
       if (arr.length > MAX_MEMORY_5S_BARS) {
@@ -350,7 +359,7 @@ export class EngineManager extends EventEmitter {
       last.high = Math.max(last.high, price);
       last.low = Math.min(last.low, price);
       last.close = price;
-      last.volume += volumeDelta;
+      last.volume += safeVol;
     }
 
     // Re-enrich tail smoothly so Dynamic Probability Line updates in real time
@@ -377,17 +386,21 @@ export class EngineManager extends EventEmitter {
     const actualClose = minuteBars[minuteBars.length - 1].close;
     const atr = Math.max(0.5, this.snapshots[key]?.atr5s ?? 1);
 
-    this.store.evaluateCompletedMinuteForecasts({
-      streamKey: key,
-      symbol: this.configs[key].symbol,
-      minuteSec,
-      actualOpen,
-      actualHigh,
-      actualLow,
-      actualClose,
-      tolerance: atr * 0.4,
-      source: this.mode,
-    });
+    try {
+      this.store.evaluateCompletedMinuteForecasts({
+        streamKey: key,
+        symbol: this.configs[key].symbol,
+        minuteSec,
+        actualOpen,
+        actualHigh,
+        actualLow,
+        actualClose,
+        tolerance: atr * 0.4,
+        source: this.mode,
+      });
+    } catch (err) {
+      console.error('[BankNifty 5s Radar] SQLite forecast eval error:', err);
+    }
   }
 
   private computeSnapshotFor(key: StreamKey, nowMs: number): RadarSnapshot {
@@ -415,49 +428,57 @@ export class EngineManager extends EventEmitter {
       // Persist newly captured :50s or :55s forecast snapshots to SQLite
       const targetMin = Math.floor(this.lastClockMs / 60000) * 60 + 60;
       if (next.locked50s && (!prev?.locked50s || prev.locked50s.minuteStartSec !== next.locked50s.minuteStartSec)) {
-        this.store.saveForecast(
-          {
-            streamKey: key,
-            symbol: this.configs[key].symbol,
-            targetMinuteSec: targetMin,
-            capturedAtSec: next.locked50s.capturedAtSec,
-            triggerSecond: 50,
-            baseLow: next.forming1mLow,
-            baseHigh: next.forming1mHigh,
-            baseClose: next.forming1mClose,
-            lowDev1m: next.lowDev1m,
-            stdDevLow: next.stdDevLow1m,
-            atr: next.atr1m,
-            bullishPct: next.locked50s.bullishPct,
-            bearishPct: next.locked50s.bearishPct,
-            predictedSupport: next.locked50s.predictedSupport,
-            predictedResistance: next.locked50s.predictedResistance,
-          },
-          this.mode
-        );
+        try {
+          this.store.saveForecast(
+            {
+              streamKey: key,
+              symbol: this.configs[key].symbol,
+              targetMinuteSec: targetMin,
+              capturedAtSec: next.locked50s.capturedAtSec,
+              triggerSecond: 50,
+              baseLow: next.forming1mLow,
+              baseHigh: next.forming1mHigh,
+              baseClose: next.forming1mClose,
+              lowDev1m: next.lowDev1m,
+              stdDevLow: next.stdDevLow1m,
+              atr: next.atr1m,
+              bullishPct: next.locked50s.bullishPct,
+              bearishPct: next.locked50s.bearishPct,
+              predictedSupport: next.locked50s.predictedSupport,
+              predictedResistance: next.locked50s.predictedResistance,
+            },
+            this.mode
+          );
+        } catch (err) {
+          console.error('[BankNifty 5s Radar] SQLite save :50s forecast error:', err);
+        }
       }
 
       if (next.locked55s && (!prev?.locked55s || prev.locked55s.minuteStartSec !== next.locked55s.minuteStartSec)) {
-        this.store.saveForecast(
-          {
-            streamKey: key,
-            symbol: this.configs[key].symbol,
-            targetMinuteSec: targetMin,
-            capturedAtSec: next.locked55s.capturedAtSec,
-            triggerSecond: 55,
-            baseLow: next.forming1mLow,
-            baseHigh: next.forming1mHigh,
-            baseClose: next.forming1mClose,
-            lowDev1m: next.lowDev1m,
-            stdDevLow: next.stdDevLow1m,
-            atr: next.atr1m,
-            bullishPct: next.locked55s.bullishPct,
-            bearishPct: next.locked55s.bearishPct,
-            predictedSupport: next.locked55s.predictedSupport,
-            predictedResistance: next.locked55s.predictedResistance,
-          },
-          this.mode
-        );
+        try {
+          this.store.saveForecast(
+            {
+              streamKey: key,
+              symbol: this.configs[key].symbol,
+              targetMinuteSec: targetMin,
+              capturedAtSec: next.locked55s.capturedAtSec,
+              triggerSecond: 55,
+              baseLow: next.forming1mLow,
+              baseHigh: next.forming1mHigh,
+              baseClose: next.forming1mClose,
+              lowDev1m: next.lowDev1m,
+              stdDevLow: next.stdDevLow1m,
+              atr: next.atr1m,
+              bullishPct: next.locked55s.bullishPct,
+              bearishPct: next.locked55s.bearishPct,
+              predictedSupport: next.locked55s.predictedSupport,
+              predictedResistance: next.locked55s.predictedResistance,
+            },
+            this.mode
+          );
+        } catch (err) {
+          console.error('[BankNifty 5s Radar] SQLite save :55s forecast error:', err);
+        }
       }
     }
 
@@ -468,6 +489,8 @@ export class EngineManager extends EventEmitter {
   }
 
   private applyLiveTickToBuffers(tick: DhanTickEvent, nowMs: number): void {
+    if (!Number.isFinite(tick.ltp) || tick.ltp <= 0) return;
+
     const nowSec = Math.floor(nowMs / 1000);
     // Keep chart bars synchronized to real-time 5s grid even if illiquid option LTT lags slightly
     const effectiveSec =
@@ -484,12 +507,12 @@ export class EngineManager extends EventEmitter {
         continue;
       }
 
-      if (tick.prevClose != null && tick.prevClose > 0) {
+      if (tick.prevClose != null && Number.isFinite(tick.prevClose) && tick.prevClose > 0) {
         this.prevCloses[key] = tick.prevClose;
       }
 
       let volDelta = 0;
-      if (tick.volume != null && tick.volume >= 0) {
+      if (tick.volume != null && Number.isFinite(tick.volume) && tick.volume >= 0) {
         const prevVol = this.lastSeenCumVolume[key];
         if (prevVol != null && tick.volume >= prevVol) {
           volDelta = tick.volume - prevVol;
@@ -501,6 +524,21 @@ export class EngineManager extends EventEmitter {
     }
   }
 
+  private clearLiveFlushTimer(): void {
+    if (this.liveFlushTimer) {
+      clearTimeout(this.liveFlushTimer);
+      this.liveFlushTimer = null;
+    }
+  }
+
+  private flushLiveUpdates(): void {
+    this.clearLiveFlushTimer();
+    if (this.mode !== 'DHAN_LIVE') return;
+    this.lastLiveFlushMs = Date.now();
+    this.recomputeAllSnapshots();
+    this.emit('broadcast', this.getFullBroadcast('TICK_UPDATE'));
+  }
+
   private handleDhanTickBatch(ticks: DhanTickEvent[]): void {
     if (this.mode !== 'DHAN_LIVE' || ticks.length === 0) return;
     const nowMs = Date.now();
@@ -510,8 +548,15 @@ export class EngineManager extends EventEmitter {
       this.applyLiveTickToBuffers(tick, nowMs);
     }
 
-    this.recomputeAllSnapshots();
-    this.emit('broadcast', this.getFullBroadcast('TICK_UPDATE'));
+    // Flush synchronously if multi-instrument REST poll or >=250ms passed; otherwise coalesce WS burst
+    if (ticks.length > 1 || nowMs - this.lastLiveFlushMs >= 250) {
+      this.flushLiveUpdates();
+    } else if (!this.liveFlushTimer) {
+      this.liveFlushTimer = setTimeout(() => {
+        this.liveFlushTimer = null;
+        this.flushLiveUpdates();
+      }, 250);
+    }
   }
 
   private async warmStreamHistoryFromDhan(keys: StreamKey[] = ALL_KEYS): Promise<void> {
@@ -570,6 +615,7 @@ export class EngineManager extends EventEmitter {
     const prevPeStrike = this.settings.peStrike;
     const prevExpiry = this.settings.expiry;
     const prevSpeed = this.settings.simSpeed;
+    const prevWindow = this.settings.windowMinutes;
     const prevCeSecId = this.configs.CE_OPTION.securityId;
     const prevPeSecId = this.configs.PE_OPTION.securityId;
 
@@ -622,6 +668,18 @@ export class EngineManager extends EventEmitter {
       }
     }
 
+    if (this.settings.windowMinutes !== prevWindow) {
+      for (const key of ALL_KEYS) {
+        if (this.candles5s[key].length > 0) {
+          this.candles5s[key] = enrichWithProbabilityLine(
+            this.candles5s[key],
+            this.settings.windowMinutes,
+            this.configs[key].tickSize
+          );
+        }
+      }
+    }
+
     this.recomputeAllSnapshots();
     const state = this.getFullBroadcast('FULL_STATE');
     this.emit('broadcast', state);
@@ -657,6 +715,7 @@ export class EngineManager extends EventEmitter {
     const runConnect = async (): Promise<DhanStatus> => {
       this.mode = 'DHAN_LIVE';
       this.stopSimulatorLoop();
+      this.clearLiveFlushTimer();
       this.lastSeenCumVolume = {};
 
       for (const key of ALL_KEYS) {
@@ -672,6 +731,7 @@ export class EngineManager extends EventEmitter {
       const subList = this.getActiveSubscriptions();
       this.dhan.connect(subList);
       this.recomputeAllSnapshots();
+      this.lastLiveFlushMs = Date.now();
       this.emit('broadcast', this.getFullBroadcast('FULL_STATE'));
       return this.getDhanStatus();
     };
@@ -723,6 +783,7 @@ export class EngineManager extends EventEmitter {
   }
 
   public switchToSimulator(): DhanStatus {
+    this.clearLiveFlushTimer();
     this.dhan.disconnect(true);
     this.mode = 'SIMULATOR';
     this.lastSeenCumVolume = {};

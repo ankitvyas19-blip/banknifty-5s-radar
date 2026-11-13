@@ -210,7 +210,7 @@ export function enrichWithProbabilityLine(
   const alphaFast = 2 / (9 + 1);
   const alphaSlow = 2 / (24 + 1);
 
-  const enriched: Candle[] = [];
+  const enriched: Candle[] = new Array<Candle>(candles5s.length);
   for (let i = 0; i < candles5s.length; i++) {
     const c = candles5s[i];
     const typical = (c.high + c.low + c.close) / 3;
@@ -219,15 +219,16 @@ export function enrichWithProbabilityLine(
 
     const probLine = round2(0.65 * fastEma + 0.35 * slowEma);
     const startIdx = Math.max(0, i - windowBars + 1);
-    const win = candles5s.slice(startIdx, i + 1);
 
     let higherLowCount = 0;
     let totalSteps = 0;
-    for (let j = 1; j < win.length; j++) {
+    for (let j = startIdx + 1; j <= i; j++) {
       totalSteps++;
-      if (win[j].low > win[j - 1].low) {
+      const cur = candles5s[j];
+      const prev = candles5s[j - 1];
+      if (cur.low > prev.low) {
         higherLowCount += 1;
-      } else if (win[j].low === win[j - 1].low && win[j].close >= win[j - 1].close) {
+      } else if (cur.low === prev.low && cur.close >= prev.close) {
         higherLowCount += 0.5;
       }
     }
@@ -235,8 +236,27 @@ export function enrichWithProbabilityLine(
     const rawHigherLowRatio = totalSteps > 0 ? higherLowCount / totalSteps : 0.5;
     const sampleWeight = Math.min(1, totalSteps / 6);
     const higherLowRatio = sampleWeight * rawHigherLowRatio + (1 - sampleWeight) * 0.5;
-    const atr = Math.max(tickSize * 2, computeATR(win, 12));
-    const prevLine = enriched.length > 0 ? (enriched[enriched.length - 1].probLine ?? probLine) : probLine;
+
+    const atrStart = Math.max(startIdx, i - 12);
+    let rawAtr = 0;
+    if (atrStart >= i) {
+      rawAtr = Math.max(0.05, c.high - c.low);
+    } else {
+      let trSum = 0;
+      for (let j = atrStart + 1; j <= i; j++) {
+        const cur = candles5s[j];
+        const prev = candles5s[j - 1];
+        trSum += Math.max(
+          cur.high - cur.low,
+          Math.abs(cur.high - prev.close),
+          Math.abs(cur.low - prev.close)
+        );
+      }
+      rawAtr = trSum / (i - atrStart);
+    }
+
+    const atr = Math.max(tickSize * 2, rawAtr);
+    const prevLine = i > 0 ? (enriched[i - 1].probLine ?? probLine) : probLine;
     const lineSlope = probLine - prevLine;
 
     const distScore = sigmoid((c.close - probLine) / (atr * 0.85));
@@ -244,11 +264,11 @@ export function enrichWithProbabilityLine(
     const rawPct = (0.38 * higherLowRatio + 0.37 * distScore + 0.25 * slopeScore) * 100;
     const bullishPct = clamp(Math.round(rawPct), 1, 99);
 
-    enriched.push({
+    enriched[i] = {
       ...c,
       probLine,
       bullishPct,
-    });
+    };
   }
 
   return enriched;
@@ -310,7 +330,16 @@ export function computeRadarSnapshot(params: ComputeSnapshotParams): RadarSnapsh
     bootstrap1m,
   } = params;
 
-  const enriched = enrichWithProbabilityLine(candles5s, windowMinutes, tickSize);
+  let needsEnrich = false;
+  for (let i = candles5s.length - 1; i >= 0; i--) {
+    if (candles5s[i].probLine == null || candles5s[i].bullishPct == null) {
+      needsEnrich = true;
+      break;
+    }
+  }
+  const enriched = needsEnrich
+    ? enrichWithProbabilityLine(candles5s, windowMinutes, tickSize)
+    : candles5s;
   const windowBars = Math.max(6, Math.round((windowMinutes * 60) / 5));
   const recent5s = enriched.slice(-windowBars);
   const latest = recent5s[recent5s.length - 1] ?? {

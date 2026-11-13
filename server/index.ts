@@ -10,6 +10,8 @@ import { RadarStore } from './store.js';
 const PORT = Number(process.env.PORT || 8080);
 const IS_PROD = process.env.NODE_ENV === 'production';
 
+let lastServerError: string | null = null;
+
 async function bootstrap(): Promise<void> {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
@@ -18,11 +20,18 @@ async function bootstrap(): Promise<void> {
   const engine = new EngineManager(store);
 
   app.get('/api/health', (_req, res) => {
+    const mem = process.memoryUsage();
     res.json({
       ok: true,
       dbPath: store.dbPath,
       dhanStatus: engine.getDhanStatus(),
       uptimeSec: Math.round(process.uptime()),
+      memoryMb: {
+        rss: Math.round(mem.rss / 1048576),
+        heapUsed: Math.round(mem.heapUsed / 1048576),
+        external: Math.round(mem.external / 1048576),
+      },
+      ...(lastServerError ? { lastServerError } : {}),
     });
   });
 
@@ -176,19 +185,46 @@ async function bootstrap(): Promise<void> {
   }
 
   const server = http.createServer(app);
-  const wss = new WebSocketServer({ server, path: '/ws' });
+  const wss = new WebSocketServer({ server, path: '/ws', perMessageDeflate: false });
+
+  wss.on('error', (err) => {
+    lastServerError = `WSS error: ${err instanceof Error ? err.message : String(err)}`;
+    console.error('[BankNifty 5s Radar] WebSocketServer error:', err);
+  });
 
   wss.on('connection', (socket: WebSocket) => {
-    socket.send(JSON.stringify(engine.getFullBroadcast('FULL_STATE')));
+    socket.on('error', () => {
+      // ignore transient client socket errors
+    });
+    try {
+      socket.send(JSON.stringify(engine.getFullBroadcast('FULL_STATE')));
+    } catch {
+      // ignore transient socket send errors
+    }
   });
 
   engine.on('broadcast', (payload) => {
+    if (wss.clients.size === 0) return;
     const encoded = JSON.stringify(payload);
     for (const client of wss.clients) {
       if (client.readyState === WebSocket.OPEN) {
-        client.send(encoded);
+        try {
+          client.send(encoded);
+        } catch {
+          // ignore closed socket send errors
+        }
       }
     }
+  });
+
+  process.on('uncaughtException', (err) => {
+    lastServerError = err instanceof Error ? err.message : String(err);
+    console.error('[BankNifty 5s Radar] Uncaught exception:', err);
+  });
+
+  process.on('unhandledRejection', (reason) => {
+    lastServerError = reason instanceof Error ? reason.message : String(reason);
+    console.error('[BankNifty 5s Radar] Unhandled rejection:', reason);
   });
 
   server.listen(PORT, '0.0.0.0', () => {

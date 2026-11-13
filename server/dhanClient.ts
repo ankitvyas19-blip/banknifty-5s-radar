@@ -189,6 +189,7 @@ export class DhanClient extends EventEmitter {
 
   private optionContracts: OptionContractInfo[] = [];
   private scripLoadedAt = 0;
+  private scripLoadPromise: Promise<OptionContractInfo[]> | null = null;
 
   public wsConnected = false;
   public transportMode: FeedTransportMode = 'IDLE';
@@ -228,21 +229,33 @@ export class DhanClient extends EventEmitter {
   }
 
   /**
-   * Loads BANKNIFTY OPTIDX contracts from Dhan's NSE_FNO instrument CSV
-   * so any strike (e.g. 61300 CE / 61300 PE) resolves reliably to SecurityId.
+   * Loads BANKNIFTY OPTIDX contracts from Dhan's NSE_FNO instrument CSV using a streaming reader
+   * so the 16MB CSV is never retained in V8 heap memory.
    */
   public async ensureScripMasterLoaded(force = false): Promise<OptionContractInfo[]> {
     const twelveHoursMs = 12 * 60 * 60 * 1000;
     if (!force && this.optionContracts.length > 0 && Date.now() - this.scripLoadedAt < twelveHoursMs) {
       return this.optionContracts;
     }
+    if (!force && this.scripLoadPromise) {
+      return this.scripLoadPromise;
+    }
 
+    const loadTask = this.loadScripMasterStreaming().finally(() => {
+      if (this.scripLoadPromise === loadTask) {
+        this.scripLoadPromise = null;
+      }
+    });
+    this.scripLoadPromise = loadTask;
+    return loadTask;
+  }
+
+  private async loadScripMasterStreaming(): Promise<OptionContractInfo[]> {
     const urls = [
       'https://api.dhan.co/v2/instrument/NSE_FNO',
       'https://images.dhan.co/api-data/api-scrip-master-detailed.csv',
     ];
 
-    let csvText = '';
     let lastFetchErr: string | null = null;
 
     for (const url of urls) {
@@ -259,80 +272,124 @@ export class DhanClient extends EventEmitter {
           lastFetchErr = `HTTP ${res.status} from ${url}`;
           continue;
         }
-        csvText = await res.text();
-        if (csvText.length > 1000) break;
+        if (!res.body) {
+          lastFetchErr = `Empty body from ${url}`;
+          continue;
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let carry = '';
+        let headerParsed = false;
+        let idxSecId = -1;
+        let idxUnderlying = -1;
+        let idxInst = -1;
+        let idxExpiry = -1;
+        let idxStrike = -1;
+        let idxOptType = -1;
+        let idxLot = -1;
+        let idxTradingSym = -1;
+        let idxDisplay = -1;
+        const parsed: OptionContractInfo[] = [];
+
+        const processLine = (rawLine: string): boolean => {
+          const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+          if (!headerParsed) {
+            if (!line) return true;
+            const header = parseCsvRow(line).map((h) => h.toUpperCase());
+            const colIdx = (names: string[]): number => {
+              for (const n of names) {
+                const idx = header.indexOf(n);
+                if (idx >= 0) return idx;
+              }
+              return -1;
+            };
+            idxSecId = colIdx(['SECURITY_ID', 'SEM_SMST_SECURITY_ID']);
+            idxUnderlying = colIdx(['UNDERLYING_SYMBOL', 'SYMBOL_NAME', 'SM_SYMBOL_NAME']);
+            idxInst = colIdx(['INSTRUMENT', 'SEM_INSTRUMENT_NAME', 'INSTRUMENT_TYPE']);
+            idxExpiry = colIdx(['SM_EXPIRY_DATE', 'EXPIRY_DATE']);
+            idxStrike = colIdx(['STRIKE_PRICE', 'SEM_STRIKE_PRICE']);
+            idxOptType = colIdx(['OPTION_TYPE', 'SEM_OPTION_TYPE']);
+            idxLot = colIdx(['LOT_SIZE', 'SEM_LOT_UNITS']);
+            idxTradingSym = colIdx(['SEM_TRADING_SYMBOL', 'TRADING_SYMBOL', 'SYMBOL_NAME']);
+            idxDisplay = colIdx(['DISPLAY_NAME', 'SEM_CUSTOM_SYMBOL']);
+            headerParsed = true;
+            if (idxSecId < 0 || idxStrike < 0 || idxOptType < 0 || idxExpiry < 0) {
+              lastFetchErr = 'Unexpected Dhan Scrip Master CSV header format';
+              return false;
+            }
+            return true;
+          }
+
+          if (!line || !line.includes('BANKNIFTY') || !line.includes('OPTIDX')) return true;
+          const cols = parseCsvRow(line);
+          const inst = (cols[idxInst] ?? '').toUpperCase();
+          if (inst !== 'OPTIDX') return true;
+
+          const underlying = (idxUnderlying >= 0 ? cols[idxUnderlying] : '').toUpperCase();
+          const disp = (idxDisplay >= 0 ? cols[idxDisplay] : '').toUpperCase();
+          if (!underlying.includes('BANKNIFTY') && !disp.startsWith('BANKNIFTY')) return true;
+
+          const optType = (cols[idxOptType] ?? '').toUpperCase();
+          if (optType !== 'CE' && optType !== 'PE') return true;
+
+          const strikePrice = Number(cols[idxStrike]);
+          const securityId = cols[idxSecId];
+          const expiry = (cols[idxExpiry] ?? '').slice(0, 10);
+          if (!securityId || !Number.isFinite(strikePrice) || !expiry) return true;
+
+          parsed.push({
+            securityId,
+            tradingSymbol: idxTradingSym >= 0 ? cols[idxTradingSym] : `BANKNIFTY ${strikePrice} ${optType}`,
+            displayName: idxDisplay >= 0 ? cols[idxDisplay] : `BANKNIFTY ${expiry} ${strikePrice} ${optType}`,
+            expiry,
+            strikePrice,
+            optionType: optType,
+            lotSize: idxLot >= 0 ? Number(cols[idxLot]) || 30 : 30,
+          });
+          return true;
+        };
+
+        let headerBad = false;
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          carry += decoder.decode(value, { stream: true });
+          let start = 0;
+          let nl = carry.indexOf('\n', start);
+          while (nl !== -1) {
+            if (!processLine(carry.slice(start, nl))) {
+              headerBad = true;
+              break;
+            }
+            start = nl + 1;
+            nl = carry.indexOf('\n', start);
+          }
+          if (headerBad) {
+            await reader.cancel().catch(() => {});
+            break;
+          }
+          carry = start > 0 ? carry.slice(start) : carry;
+        }
+
+        if (!headerBad) {
+          carry += decoder.decode();
+          if (carry.length > 0) {
+            processLine(carry);
+          }
+        }
+
+        if (parsed.length > 0) {
+          this.optionContracts = parsed;
+          this.scripLoadedAt = Date.now();
+          return this.optionContracts;
+        }
       } catch (err) {
         lastFetchErr = err instanceof Error ? err.message : String(err);
       }
     }
 
-    if (!csvText) {
-      if (lastFetchErr) this.lastError = `Scrip master fetch failed: ${lastFetchErr}`;
-      return this.optionContracts;
-    }
-
-    const lines = csvText.split(/\r?\n/);
-    if (lines.length < 2) return this.optionContracts;
-
-    const header = parseCsvRow(lines[0]).map((h) => h.toUpperCase());
-    const colIdx = (names: string[]): number => {
-      for (const n of names) {
-        const idx = header.indexOf(n);
-        if (idx >= 0) return idx;
-      }
-      return -1;
-    };
-
-    const idxSecId = colIdx(['SECURITY_ID', 'SEM_SMST_SECURITY_ID']);
-    const idxUnderlying = colIdx(['UNDERLYING_SYMBOL', 'SYMBOL_NAME', 'SM_SYMBOL_NAME']);
-    const idxInst = colIdx(['INSTRUMENT', 'SEM_INSTRUMENT_NAME', 'INSTRUMENT_TYPE']);
-    const idxExpiry = colIdx(['SM_EXPIRY_DATE', 'EXPIRY_DATE']);
-    const idxStrike = colIdx(['STRIKE_PRICE', 'SEM_STRIKE_PRICE']);
-    const idxOptType = colIdx(['OPTION_TYPE', 'SEM_OPTION_TYPE']);
-    const idxLot = colIdx(['LOT_SIZE', 'SEM_LOT_UNITS']);
-    const idxTradingSym = colIdx(['SEM_TRADING_SYMBOL', 'TRADING_SYMBOL', 'SYMBOL_NAME']);
-    const idxDisplay = colIdx(['DISPLAY_NAME', 'SEM_CUSTOM_SYMBOL']);
-
-    if (idxSecId < 0 || idxStrike < 0 || idxOptType < 0 || idxExpiry < 0) {
-      this.lastError = 'Unexpected Dhan Scrip Master CSV header format';
-      return this.optionContracts;
-    }
-
-    const parsed: OptionContractInfo[] = [];
-    for (let i = 1; i < lines.length; i++) {
-      const line = lines[i];
-      if (!line || !line.includes('BANKNIFTY') || !line.includes('OPTIDX')) continue;
-      const cols = parseCsvRow(line);
-      const inst = (cols[idxInst] ?? '').toUpperCase();
-      if (inst !== 'OPTIDX') continue;
-
-      const underlying = (idxUnderlying >= 0 ? cols[idxUnderlying] : '').toUpperCase();
-      const disp = (idxDisplay >= 0 ? cols[idxDisplay] : '').toUpperCase();
-      if (!underlying.includes('BANKNIFTY') && !disp.startsWith('BANKNIFTY')) continue;
-
-      const optType = (cols[idxOptType] ?? '').toUpperCase();
-      if (optType !== 'CE' && optType !== 'PE') continue;
-
-      const strikePrice = Number(cols[idxStrike]);
-      const securityId = cols[idxSecId];
-      const expiry = (cols[idxExpiry] ?? '').slice(0, 10);
-      if (!securityId || !Number.isFinite(strikePrice) || !expiry) continue;
-
-      parsed.push({
-        securityId,
-        tradingSymbol: idxTradingSym >= 0 ? cols[idxTradingSym] : `BANKNIFTY ${strikePrice} ${optType}`,
-        displayName: idxDisplay >= 0 ? cols[idxDisplay] : `BANKNIFTY ${expiry} ${strikePrice} ${optType}`,
-        expiry,
-        strikePrice,
-        optionType: optType,
-        lotSize: idxLot >= 0 ? Number(cols[idxLot]) || 30 : 30,
-      });
-    }
-
-    if (parsed.length > 0) {
-      this.optionContracts = parsed;
-      this.scripLoadedAt = Date.now();
-    }
+    if (lastFetchErr) this.lastError = `Scrip master fetch failed: ${lastFetchErr}`;
     return this.optionContracts;
   }
 
@@ -635,7 +692,9 @@ export class DhanClient extends EventEmitter {
         process.env.http_proxy
     );
 
-    const ws = hasProxy ? new WebSocket(url, { agent: https.globalAgent }) : new WebSocket(url);
+    const ws = hasProxy
+      ? new WebSocket(url, { agent: https.globalAgent, perMessageDeflate: false })
+      : new WebSocket(url, { perMessageDeflate: false });
     ws.binaryType = 'nodebuffer';
     this.ws = ws;
 
@@ -666,12 +725,16 @@ export class DhanClient extends EventEmitter {
     });
 
     ws.on('message', (data: WebSocket.RawData) => {
-      const buf = Buffer.isBuffer(data)
-        ? data
-        : Array.isArray(data)
-          ? Buffer.concat(data)
-          : Buffer.from(data);
-      this.parseBinaryPacket(buf);
+      try {
+        const buf = Buffer.isBuffer(data)
+          ? data
+          : Array.isArray(data)
+            ? Buffer.concat(data)
+            : Buffer.from(data);
+        this.parseBinaryPacket(buf);
+      } catch (err) {
+        this.lastError = `WS packet decode warning: ${err instanceof Error ? err.message : String(err)}`;
+      }
     });
 
     ws.on('error', (err) => {
@@ -778,14 +841,19 @@ export class DhanClient extends EventEmitter {
 
     // RequestCode 17 = Subscribe Quote Packet (includes LTP, LTQ, LTT, ATP, Volume, Day OHLC)
     for (let i = 0; i < instruments.length; i += 100) {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
       const batch = instruments.slice(i, i + 100);
-      this.ws.send(
-        JSON.stringify({
-          RequestCode: 17,
-          InstrumentCount: batch.length,
-          InstrumentList: batch,
-        })
-      );
+      try {
+        this.ws.send(
+          JSON.stringify({
+            RequestCode: 17,
+            InstrumentCount: batch.length,
+            InstrumentList: batch,
+          })
+        );
+      } catch (err) {
+        this.lastError = err instanceof Error ? err.message : String(err);
+      }
     }
   }
 
@@ -807,16 +875,16 @@ export class DhanClient extends EventEmitter {
    *   [4..7]  int32LE Security ID
    */
   private parseBinaryPacket(buf: Buffer): void {
+    if (!Buffer.isBuffer(buf) || buf.length < 8) return;
     let offset = 0;
     while (offset + 8 <= buf.length) {
       const responseCode = buf.readUInt8(offset);
       const messageLength = buf.readInt16LE(offset + 1);
+      if (messageLength < 8) break;
+
       const segByte = buf.readUInt8(offset + 3);
       const securityId = String(buf.readInt32LE(offset + 4));
-      const packetEnd =
-        messageLength >= 8 && offset + messageLength <= buf.length
-          ? offset + messageLength
-          : buf.length;
+      const packetEnd = offset + messageLength <= buf.length ? offset + messageLength : buf.length;
 
       const exchangeSegment = SEGMENT_ENUM_TO_NAME[segByte] ?? 'OTHER';
       const nowSec = Math.floor(Date.now() / 1000);
@@ -824,39 +892,54 @@ export class DhanClient extends EventEmitter {
       if (responseCode === 2 && packetEnd >= offset + 16) {
         // Ticker packet
         const ltp = buf.readFloatLE(offset + 8);
-        const lttSec = buf.readInt32LE(offset + 12) || nowSec;
-        this.lastTickAt = Date.now();
-        this.emit('tick', {
-          exchangeSegmentByte: segByte,
-          exchangeSegment,
-          securityId,
-          ltp,
-          lttSec,
-        } satisfies DhanTickEvent);
+        const rawLtt = buf.readInt32LE(offset + 12);
+        const lttSec = rawLtt > 1_000_000_000 ? rawLtt : nowSec;
+        if (Number.isFinite(ltp) && ltp > 0 && ltp < 10_000_000) {
+          this.lastTickAt = Date.now();
+          this.emit('tick', {
+            exchangeSegmentByte: segByte,
+            exchangeSegment,
+            securityId,
+            ltp,
+            lttSec,
+          } satisfies DhanTickEvent);
+        }
       } else if ((responseCode === 4 || responseCode === 8) && packetEnd >= offset + 26) {
         // Quote (4) or Full (8) packet
         const ltp = buf.readFloatLE(offset + 8);
-        const lttSec = buf.readInt32LE(offset + 14) || nowSec;
-        const volume = buf.readInt32LE(offset + 22);
-        const oi = responseCode === 8 && packetEnd >= offset + 38 ? buf.readInt32LE(offset + 34) : undefined;
-        this.lastTickAt = Date.now();
-        this.emit('tick', {
-          exchangeSegmentByte: segByte,
-          exchangeSegment,
-          securityId,
-          ltp,
-          lttSec,
-          volume,
-          oi,
-        } satisfies DhanTickEvent);
+        const rawLtt = buf.readInt32LE(offset + 14);
+        const lttSec = rawLtt > 1_000_000_000 ? rawLtt : nowSec;
+        const rawVol = buf.readInt32LE(offset + 22);
+        const volume = Number.isFinite(rawVol) && rawVol >= 0 ? rawVol : undefined;
+        const rawOi =
+          responseCode === 8 && packetEnd >= offset + 38 ? buf.readInt32LE(offset + 34) : undefined;
+        const oi = rawOi != null && Number.isFinite(rawOi) && rawOi >= 0 ? rawOi : undefined;
+        if (Number.isFinite(ltp) && ltp > 0 && ltp < 10_000_000) {
+          this.lastTickAt = Date.now();
+          this.emit('tick', {
+            exchangeSegmentByte: segByte,
+            exchangeSegment,
+            securityId,
+            ltp,
+            lttSec,
+            volume,
+            oi,
+          } satisfies DhanTickEvent);
+        }
       } else if (responseCode === 6 && packetEnd >= offset + 16) {
         // PrevClose packet
         const prevClose = buf.readFloatLE(offset + 8);
-        this.emit('prevClose', {
-          exchangeSegment,
-          securityId,
-          prevClose,
-        });
+        if (Number.isFinite(prevClose) && prevClose > 0 && prevClose < 10_000_000) {
+          const cacheKey = `${exchangeSegment}:${securityId}`;
+          if (this.prevCloseCache.get(cacheKey) !== prevClose) {
+            this.prevCloseCache.set(cacheKey, prevClose);
+            this.emit('prevClose', {
+              exchangeSegment,
+              securityId,
+              prevClose,
+            });
+          }
+        }
       } else if (responseCode === 50 && packetEnd >= offset + 10) {
         const disconnectCode = buf.readInt16LE(offset + 8);
         this.lastError =
@@ -864,7 +947,6 @@ export class DhanClient extends EventEmitter {
         this.emit('status');
       }
 
-      if (messageLength < 8) break;
       offset = packetEnd;
     }
   }
