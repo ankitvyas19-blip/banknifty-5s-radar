@@ -467,7 +467,7 @@ export class DhanClient extends EventEmitter {
   }): Promise<Candle[]> {
     if (!this.credentials || params.securityId.startsWith('SIM_')) return [];
 
-    const todayIst = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    const todayIst = new Date(Date.now() + 19_800_000).toISOString().slice(0, 10);
     const fromDate = `${todayIst} 09:15:00`;
     const toDate = `${todayIst} 15:30:00`;
 

@@ -31,15 +31,30 @@ function fmtSigned(v: number): string {
   return `${prefix}${v.toFixed(2)}`;
 }
 
+const IST_TIME_SEC_FMT = new Intl.DateTimeFormat('en-IN', {
+  timeZone: 'Asia/Kolkata',
+  hour12: false,
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+});
+
+const IST_TIME_MIN_FMT = new Intl.DateTimeFormat('en-IN', {
+  timeZone: 'Asia/Kolkata',
+  hour12: false,
+  hour: '2-digit',
+  minute: '2-digit',
+});
+
+const IST_DATE_FMT = new Intl.DateTimeFormat('en-IN', {
+  timeZone: 'Asia/Kolkata',
+  day: '2-digit',
+  month: 'short',
+});
+
 function fmtIstAxis(unixSec: number): string {
   try {
-    return new Intl.DateTimeFormat('en-IN', {
-      timeZone: 'Asia/Kolkata',
-      hour12: false,
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-    }).format(new Date(unixSec * 1000));
+    return IST_TIME_SEC_FMT.format(new Date(unixSec * 1000));
   } catch {
     return String(unixSec);
   }
@@ -52,18 +67,9 @@ function fmtIstTickMark(time: Time, tickMarkType: TickMarkType): string | null {
       return fmtIstAxis(time);
     }
     if (tickMarkType === TickMarkType.Time) {
-      return new Intl.DateTimeFormat('en-IN', {
-        timeZone: 'Asia/Kolkata',
-        hour12: false,
-        hour: '2-digit',
-        minute: '2-digit',
-      }).format(new Date(time * 1000));
+      return IST_TIME_MIN_FMT.format(new Date(time * 1000));
     }
-    return new Intl.DateTimeFormat('en-IN', {
-      timeZone: 'Asia/Kolkata',
-      day: '2-digit',
-      month: 'short',
-    }).format(new Date(time * 1000));
+    return IST_DATE_FMT.format(new Date(time * 1000));
   } catch {
     return null;
   }

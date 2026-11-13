@@ -23,7 +23,7 @@ async function bootstrap(): Promise<void> {
     const mem = process.memoryUsage();
     res.json({
       ok: true,
-      runtimeTag: 'node24-slim-v2',
+      runtimeTag: 'node24-slim-v3',
       dbPath: store.dbPath,
       dhanStatus: engine.getDhanStatus(),
       uptimeSec: Math.round(process.uptime()),

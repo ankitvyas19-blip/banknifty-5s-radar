@@ -63,17 +63,15 @@ export function computeEMA(values: number[], period: number): number {
   return ema;
 }
 
+const IST_OFFSET_SEC = 19800; // Asia/Kolkata is fixed UTC+05:30 with no DST
+
+function istDayIndex(timestampSec: number): number {
+  return Math.floor((timestampSec + IST_OFFSET_SEC) / 86400);
+}
+
 export function formatIstDateKey(timestampSec: number): string {
-  try {
-    return new Intl.DateTimeFormat('en-CA', {
-      timeZone: 'Asia/Kolkata',
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-    }).format(new Date(timestampSec * 1000));
-  } catch {
-    return new Date(timestampSec * 1000).toISOString().slice(0, 10);
-  }
+  if (!Number.isFinite(timestampSec)) return '1970-01-01';
+  return new Date((Math.floor(timestampSec) + IST_OFFSET_SEC) * 1000).toISOString().slice(0, 10);
 }
 
 /**
@@ -82,11 +80,11 @@ export function formatIstDateKey(timestampSec: number): string {
  */
 export function computeSessionVwap(bars1m: Candle[]): number | null {
   if (bars1m.length === 0) return null;
-  const latestDay = formatIstDateKey(bars1m[bars1m.length - 1].time);
+  const latestDay = istDayIndex(bars1m[bars1m.length - 1].time);
   let cumTpVol = 0;
   let cumVol = 0;
   for (const b of bars1m) {
-    if (formatIstDateKey(b.time) !== latestDay) continue;
+    if (istDayIndex(b.time) !== latestDay) continue;
     const vol = b.volume > 0 ? b.volume : 0;
     if (vol <= 0) continue;
     const typical = (b.high + b.low + b.close) / 3;
@@ -275,32 +273,17 @@ export function enrichWithProbabilityLine(
 }
 
 export function formatIstTime(timestampMs: number): string {
-  try {
-    return new Intl.DateTimeFormat('en-IN', {
-      timeZone: 'Asia/Kolkata',
-      hour12: false,
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-    }).format(new Date(timestampMs));
-  } catch {
-    const d = new Date(timestampMs);
-    return d.toISOString().slice(11, 19);
-  }
+  if (!Number.isFinite(timestampMs)) return '00:00:00';
+  return new Date(Math.floor(timestampMs / 1000) * 1000 + IST_OFFSET_SEC * 1000)
+    .toISOString()
+    .slice(11, 19);
 }
 
 export function formatIstMinute(timestampSec: number): string {
-  try {
-    return new Intl.DateTimeFormat('en-IN', {
-      timeZone: 'Asia/Kolkata',
-      hour12: false,
-      hour: '2-digit',
-      minute: '2-digit',
-    }).format(new Date(timestampSec * 1000));
-  } catch {
-    const d = new Date(timestampSec * 1000);
-    return d.toISOString().slice(11, 16);
-  }
+  if (!Number.isFinite(timestampSec)) return '00:00';
+  return new Date((Math.floor(timestampSec) + IST_OFFSET_SEC) * 1000)
+    .toISOString()
+    .slice(11, 16);
 }
 
 export interface ComputeSnapshotParams {
@@ -955,7 +938,7 @@ function buildIncremental1mStates(
   let ema9 = bars[0].close;
   let ema21 = bars[0].close;
 
-  let curDay = formatIstDateKey(bars[0].time);
+  let curDay = istDayIndex(bars[0].time);
   let cumTpVol = 0;
   let cumVol = 0;
 
@@ -978,7 +961,7 @@ function buildIncremental1mStates(
       ema21 = alpha21 * c.close + (1 - alpha21) * ema21;
     }
 
-    const dayKey = formatIstDateKey(c.time);
+    const dayKey = istDayIndex(c.time);
     if (dayKey !== curDay) {
       curDay = dayKey;
       cumTpVol = 0;
