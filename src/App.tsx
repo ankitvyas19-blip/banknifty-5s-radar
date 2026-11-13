@@ -1,10 +1,12 @@
 import { useState } from 'react';
 import {
   Activity,
+  AlertTriangle,
   BarChart3,
   Clock,
   Pause,
   Play,
+  PlugZap,
   RotateCcw,
   Settings2,
 } from 'lucide-react';
@@ -155,11 +157,42 @@ export function App() {
                   ? 'DHANHQ LIVE (REST 1s)'
                   : 'DHANHQ LIVE'
                 : 'DHAN RECONNECTING'
-              : 'SIMULATOR MODE'}
+              : 'DEMO SIMULATOR (NOT LIVE)'}
             {!connected && ' (WS OFFLINE)'}
           </button>
         </div>
       </header>
+
+      {dhanStatus.mode === 'SIMULATOR' && tab !== 'SETUP' && (
+        <div className="mode-alert-bar" role="status">
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <AlertTriangle size={15} />
+            <span>
+              <strong>DEMO SIMULATOR DATA (Not Live NSE):</strong> Abhi fake test prices (~61,570
+              / ~25,680) chal rahe hain. Real NSE BankNifty / Nifty / Options prices dekhne ke liye
+              DhanHQ Token connect karein.
+            </span>
+          </div>
+          <button className="btn btn-primary" onClick={() => setTab('SETUP')}>
+            <PlugZap size={13} />
+            Connect DhanHQ Live →
+          </button>
+        </div>
+      )}
+
+      {dhanStatus.mode === 'DHAN_LIVE' && dhanStatus.lastError && tab !== 'SETUP' && (
+        <div className="mode-alert-bar err" role="alert">
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <AlertTriangle size={15} />
+            <span>
+              <strong>DhanHQ Feed Issue:</strong> {dhanStatus.lastError}
+            </span>
+          </div>
+          <button className="btn" onClick={() => setTab('SETUP')}>
+            Check Token / Setup →
+          </button>
+        </div>
+      )}
 
       {/* Trade Strike & Formula Control Ribbon */}
       <div className="control-ribbon">
@@ -175,13 +208,16 @@ export function App() {
               onKeyDown={(e) => e.key === 'Enter' && void applyStrikesAndTrades()}
             />
           </label>
-          <label className="field-box">
+          <label
+            className="field-box"
+            title="Optional Call option buy price in ₹ (e.g. 240), NOT Strike/Spot"
+          >
             <span className="field-label">CE Entry ₹</span>
             <input
               className="field-input narrow"
               type="number"
               step={0.05}
-              placeholder="e.g. 32"
+              placeholder="Opt ₹"
               value={ceEntryDraft}
               onChange={(e) => setDrafts((d) => ({ ...d, ceEntry: e.target.value }))}
               onKeyDown={(e) => e.key === 'Enter' && void applyStrikesAndTrades()}
@@ -199,13 +235,16 @@ export function App() {
               onKeyDown={(e) => e.key === 'Enter' && void applyStrikesAndTrades()}
             />
           </label>
-          <label className="field-box">
+          <label
+            className="field-box"
+            title="Optional Put option buy price in ₹ (e.g. 190), NOT Strike/Spot"
+          >
             <span className="field-label">PE Entry ₹</span>
             <input
               className="field-input narrow"
               type="number"
               step={0.05}
-              placeholder="Optional"
+              placeholder="Opt ₹"
               value={peEntryDraft}
               onChange={(e) => setDrafts((d) => ({ ...d, peEntry: e.target.value }))}
               onKeyDown={(e) => e.key === 'Enter' && void applyStrikesAndTrades()}

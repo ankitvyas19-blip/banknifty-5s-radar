@@ -456,7 +456,12 @@ export class EngineManager extends EventEmitter {
     const tickMs = effectiveSec * 1000;
 
     for (const key of ALL_KEYS) {
-      if (this.configs[key].securityId !== tick.securityId) continue;
+      if (
+        this.configs[key].exchangeSegment !== tick.exchangeSegment ||
+        this.configs[key].securityId !== tick.securityId
+      ) {
+        continue;
+      }
 
       if (tick.prevClose != null && tick.prevClose > 0) {
         this.prevCloses[key] = tick.prevClose;

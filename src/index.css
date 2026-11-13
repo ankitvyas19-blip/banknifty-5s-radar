@@ -188,9 +188,28 @@ body {
 }
 
 .status-chip.sim {
-  background: var(--ice-soft);
-  color: #7dd3fc;
-  border-color: rgba(56, 189, 248, 0.3);
+  background: var(--amber-soft);
+  color: #fcd34d;
+  border-color: rgba(245, 158, 11, 0.45);
+}
+
+.mode-alert-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 18px;
+  font-size: 12px;
+  border-bottom: 1px solid rgba(245, 158, 11, 0.35);
+  background: rgba(245, 158, 11, 0.12);
+  color: #fde68a;
+}
+
+.mode-alert-bar.err {
+  border-bottom-color: rgba(244, 63, 94, 0.4);
+  background: rgba(244, 63, 94, 0.14);
+  color: #fecdd3;
 }
 
 .dot {

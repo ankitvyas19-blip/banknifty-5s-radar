@@ -4,10 +4,12 @@ import {
   ColorType,
   LineSeries,
   LineStyle,
+  TickMarkType,
   createChart,
   type IChartApi,
   type IPriceLine,
   type ISeriesApi,
+  type Time,
   type UTCTimestamp,
 } from 'lightweight-charts';
 import type { StreamPayload, Timeframe } from '../../shared/types.js';
@@ -40,6 +42,30 @@ function fmtIstAxis(unixSec: number): string {
     }).format(new Date(unixSec * 1000));
   } catch {
     return String(unixSec);
+  }
+}
+
+function fmtIstTickMark(time: Time, tickMarkType: TickMarkType): string | null {
+  if (typeof time !== 'number') return null;
+  try {
+    if (tickMarkType === TickMarkType.TimeWithSeconds) {
+      return fmtIstAxis(time);
+    }
+    if (tickMarkType === TickMarkType.Time) {
+      return new Intl.DateTimeFormat('en-IN', {
+        timeZone: 'Asia/Kolkata',
+        hour12: false,
+        hour: '2-digit',
+        minute: '2-digit',
+      }).format(new Date(time * 1000));
+    }
+    return new Intl.DateTimeFormat('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      day: '2-digit',
+      month: 'short',
+    }).format(new Date(time * 1000));
+  } catch {
+    return null;
   }
 }
 
@@ -80,6 +106,8 @@ export function RadarPanel({ stream, timeframe }: RadarPanelProps) {
         timeVisible: true,
         secondsVisible: true,
         rightOffset: 6,
+        tickMarkFormatter: (time: Time, tickMarkType: TickMarkType) =>
+          fmtIstTickMark(time, tickMarkType),
       },
       localization: {
         timeFormatter: (t: number) => fmtIstAxis(t),
