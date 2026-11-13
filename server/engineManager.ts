@@ -18,7 +18,7 @@ import type {
   StreamKey,
   StreamPayload,
 } from '../shared/types.js';
-import { DhanClient, type DhanTickEvent } from './dhanClient.js';
+import { DhanClient, type DhanTickEvent, type SubscribedInstrument } from './dhanClient.js';
 import { MarketSimulator } from './simulator.js';
 import { RadarStore } from './store.js';
 
@@ -48,12 +48,19 @@ export class EngineManager extends EventEmitter {
     CE_OPTION: [],
     PE_OPTION: [],
   };
+  private bootstrap1m: Record<StreamKey, Candle[]> = {
+    BANKNIFTY_SPOT: [],
+    NIFTY_SPOT: [],
+    CE_OPTION: [],
+    PE_OPTION: [],
+  };
   private prevCloses: Record<StreamKey, number> = {
     BANKNIFTY_SPOT: 61300,
     NIFTY_SPOT: 25620,
     CE_OPTION: 230,
     PE_OPTION: 185,
   };
+  private lastSeenCumVolume: Partial<Record<StreamKey, number>> = {};
   private snapshots: Record<StreamKey, RadarSnapshot> = {} as Record<StreamKey, RadarSnapshot>;
   private lastPersisted5sTime: Record<StreamKey, number> = {
     BANKNIFTY_SPOT: 0,
@@ -101,7 +108,7 @@ export class EngineManager extends EventEmitter {
       this.settings.simScenario
     );
 
-    // Seed initial simulator data cleanly
+    // Seed initial simulator data cleanly so snapshots exist immediately
     this.seedSimulatorHistory(this.settings.simScenario);
 
     this.snapshots = {
@@ -111,8 +118,9 @@ export class EngineManager extends EventEmitter {
       PE_OPTION: this.computeSnapshotFor('PE_OPTION', this.lastClockMs),
     };
 
-    // Wire DhanHQ live events
-    this.dhan.on('tick', (tick: DhanTickEvent) => this.handleDhanTick(tick));
+    // Wire DhanHQ live events (both individual binary WS ticks and batched REST ticks)
+    this.dhan.on('tick', (tick: DhanTickEvent) => this.handleDhanTickBatch([tick]));
+    this.dhan.on('ticks', (ticks: DhanTickEvent[]) => this.handleDhanTickBatch(ticks));
     this.dhan.on('prevClose', (ev: { securityId: string; prevClose: number }) => {
       for (const key of ALL_KEYS) {
         if (this.configs[key].securityId === ev.securityId && ev.prevClose > 0) {
@@ -126,7 +134,9 @@ export class EngineManager extends EventEmitter {
 
     // If DHAN env vars are provided & DHAN_AUTO_CONNECT=true, auto-connect
     if (this.dhan.hasCredentials() && process.env.DHAN_AUTO_CONNECT === 'true') {
-      void this.connectDhanLive();
+      void this.connectDhanLive().catch((err) => {
+        console.error('[BankNifty 5s Radar] Initial Dhan auto-connect error:', err);
+      });
     } else {
       this.startSimulatorLoop();
     }
@@ -181,6 +191,13 @@ export class EngineManager extends EventEmitter {
     };
   }
 
+  private getActiveSubscriptions(): SubscribedInstrument[] {
+    return ALL_KEYS.filter((k) => !this.configs[k].securityId.startsWith('SIM_')).map((k) => ({
+      ExchangeSegment: this.configs[k].exchangeSegment,
+      SecurityId: this.configs[k].securityId,
+    }));
+  }
+
   public seedSimulatorHistory(scenario = this.settings.simScenario): void {
     this.store.clearSimulatorCandles();
     const seeded = this.sim.seedHistory(
@@ -192,6 +209,9 @@ export class EngineManager extends EventEmitter {
 
     this.lastClockMs = seeded.lastSimMs;
     this.prevCloses = seeded.prevClose;
+    for (const key of ALL_KEYS) {
+      this.bootstrap1m[key] = [];
+    }
 
     for (const key of ALL_KEYS) {
       const enriched = enrichWithProbabilityLine(
@@ -221,7 +241,7 @@ export class EngineManager extends EventEmitter {
       tickSize: this.configs[key].tickSize,
     });
 
-    const tol = Math.max(0.5, candles[candles.length - 1]?.close * 0.0005 || 1);
+    const tol = Math.max(0.5, (candles[candles.length - 1]?.close ?? 100) * 0.0005 || 1);
     for (const row of bt.rows.slice(0, 12)) {
       const rec: ForecastRecord = {
         streamKey: key,
@@ -366,6 +386,7 @@ export class EngineManager extends EventEmitter {
       tickSize: this.configs[key].tickSize,
       prevLocked50s: prevSnap?.locked50s ?? null,
       prevLocked55s: prevSnap?.locked55s ?? null,
+      bootstrap1m: this.mode === 'DHAN_LIVE' ? this.bootstrap1m[key] : undefined,
     });
   }
 
@@ -425,25 +446,108 @@ export class EngineManager extends EventEmitter {
     }
   }
 
-  private handleDhanTick(tick: DhanTickEvent): void {
-    if (this.mode !== 'DHAN_LIVE') return;
-    const tickMs = (tick.lttSec > 1000000000 ? tick.lttSec * 1000 : Date.now());
-    this.lastClockMs = Date.now();
+  private applyLiveTickToBuffers(tick: DhanTickEvent, nowMs: number): void {
+    const nowSec = Math.floor(nowMs / 1000);
+    // Keep chart bars synchronized to real-time 5s grid even if illiquid option LTT lags slightly
+    const effectiveSec =
+      tick.lttSec > 1_000_000_000 && Math.abs(nowSec - tick.lttSec) <= 3
+        ? tick.lttSec
+        : nowSec;
+    const tickMs = effectiveSec * 1000;
 
     for (const key of ALL_KEYS) {
-      if (this.configs[key].securityId === tick.securityId) {
-        this.ingestTick(key, tick.ltp, tick.volume ?? 0, tickMs);
+      if (this.configs[key].securityId !== tick.securityId) continue;
+
+      if (tick.prevClose != null && tick.prevClose > 0) {
+        this.prevCloses[key] = tick.prevClose;
       }
+
+      let volDelta = 0;
+      if (tick.volume != null && tick.volume >= 0) {
+        const prevVol = this.lastSeenCumVolume[key];
+        if (prevVol != null && tick.volume >= prevVol) {
+          volDelta = tick.volume - prevVol;
+        }
+        this.lastSeenCumVolume[key] = tick.volume;
+      }
+
+      this.ingestTick(key, tick.ltp, volDelta, tickMs);
     }
+  }
+
+  private handleDhanTickBatch(ticks: DhanTickEvent[]): void {
+    if (this.mode !== 'DHAN_LIVE' || ticks.length === 0) return;
+    const nowMs = Date.now();
+    this.lastClockMs = nowMs;
+
+    for (const tick of ticks) {
+      this.applyLiveTickToBuffers(tick, nowMs);
+    }
+
     this.recomputeAllSnapshots();
     this.emit('broadcast', this.getFullBroadcast('TICK_UPDATE'));
+  }
+
+  private async warmStreamHistoryFromDhan(keys: StreamKey[] = ALL_KEYS): Promise<void> {
+    if (this.mode !== 'DHAN_LIVE') return;
+
+    const currentMinuteSec = Math.floor(Date.now() / 60000) * 60;
+    await Promise.all(
+      keys.map(async (key) => {
+        const cfg = this.configs[key];
+        if (cfg.securityId.startsWith('SIM_')) return;
+
+        // Restore any recorded live 5s bars from SQLite first
+        const saved = this.store.getRecentCandles5s(key, cfg.symbol, 'DHAN_LIVE', MAX_MEMORY_5S_BARS);
+        if (saved.length > 0) {
+          this.candles5s[key] = enrichWithProbabilityLine(
+            saved,
+            this.settings.windowMinutes,
+            cfg.tickSize
+          );
+          this.lastPersisted5sTime[key] = saved[saved.length - 1]?.time ?? 0;
+        } else {
+          this.candles5s[key] = [];
+          this.lastPersisted5sTime[key] = 0;
+        }
+
+        // Fetch recent completed NSE 1m bars so prev1mLow / atr1m are real immediately
+        const bars1m = await this.dhan.fetchRecent1mCandles({
+          exchangeSegment: cfg.exchangeSegment,
+          securityId: cfg.securityId,
+          instrument: cfg.exchangeSegment === 'IDX_I' ? 'INDEX' : 'OPTIDX',
+          limit: 16,
+        });
+        this.bootstrap1m[key] = bars1m.filter((b) => b.time < currentMinuteSec);
+      })
+    );
+
+    const subs = keys
+      .filter((k) => !this.configs[k].securityId.startsWith('SIM_'))
+      .map((k) => ({
+        ExchangeSegment: this.configs[k].exchangeSegment,
+        SecurityId: this.configs[k].securityId,
+      }));
+    if (subs.length > 0) {
+      const initialQuotes = await this.dhan.fetchMarketQuotesOnce(subs);
+      if (initialQuotes.ok && initialQuotes.ticks.length > 0) {
+        const nowMs = Date.now();
+        this.lastClockMs = nowMs;
+        for (const t of initialQuotes.ticks) {
+          this.applyLiveTickToBuffers(t, nowMs);
+        }
+      }
+    }
   }
 
   public async updateSettings(partial: Partial<RadarSettings>): Promise<RadarBroadcast> {
     const prevScenario = this.settings.simScenario;
     const prevCeStrike = this.settings.ceStrike;
     const prevPeStrike = this.settings.peStrike;
+    const prevExpiry = this.settings.expiry;
     const prevSpeed = this.settings.simSpeed;
+    const prevCeSecId = this.configs.CE_OPTION.securityId;
+    const prevPeSecId = this.configs.PE_OPTION.securityId;
 
     this.settings = { ...this.settings, ...partial };
     this.store.saveSettings(this.settings);
@@ -470,6 +574,28 @@ export class EngineManager extends EventEmitter {
       }
     } else if (this.mode === 'DHAN_LIVE') {
       await this.resolveAndSubscribeLiveOptions();
+      const changedKeys: StreamKey[] = [];
+      if (
+        this.configs.CE_OPTION.securityId !== prevCeSecId ||
+        this.settings.ceStrike !== prevCeStrike ||
+        this.settings.expiry !== prevExpiry
+      ) {
+        this.lastSeenCumVolume.CE_OPTION = undefined;
+        this.lastEvaluated1mSec.CE_OPTION = 0;
+        changedKeys.push('CE_OPTION');
+      }
+      if (
+        this.configs.PE_OPTION.securityId !== prevPeSecId ||
+        this.settings.peStrike !== prevPeStrike ||
+        this.settings.expiry !== prevExpiry
+      ) {
+        this.lastSeenCumVolume.PE_OPTION = undefined;
+        this.lastEvaluated1mSec.PE_OPTION = 0;
+        changedKeys.push('PE_OPTION');
+      }
+      if (changedKeys.length > 0) {
+        await this.warmStreamHistoryFromDhan(changedKeys);
+      }
     }
 
     this.recomputeAllSnapshots();
@@ -506,37 +632,19 @@ export class EngineManager extends EventEmitter {
 
     this.mode = 'DHAN_LIVE';
     this.stopSimulatorLoop();
+    this.lastSeenCumVolume = {};
 
-    // Reset live buffers & load any previously recorded DHAN_LIVE bars from SQLite
     for (const key of ALL_KEYS) {
       this.candles5s[key] = [];
+      this.bootstrap1m[key] = [];
+      this.lastPersisted5sTime[key] = 0;
+      this.lastEvaluated1mSec[key] = 0;
     }
 
     await this.resolveAndSubscribeLiveOptions();
+    await this.warmStreamHistoryFromDhan(ALL_KEYS);
 
-    for (const key of ALL_KEYS) {
-      const saved = this.store.getRecentCandles5s(
-        key,
-        this.configs[key].symbol,
-        'DHAN_LIVE',
-        MAX_MEMORY_5S_BARS
-      );
-      if (saved.length > 0) {
-        this.candles5s[key] = enrichWithProbabilityLine(
-          saved,
-          this.settings.windowMinutes,
-          this.configs[key].tickSize
-        );
-      }
-    }
-
-    const subList = ALL_KEYS.filter((k) => !this.configs[k].securityId.startsWith('SIM_')).map(
-      (k) => ({
-        ExchangeSegment: this.configs[k].exchangeSegment,
-        SecurityId: this.configs[k].securityId,
-      })
-    );
-
+    const subList = this.getActiveSubscriptions();
     this.dhan.connect(subList);
     this.recomputeAllSnapshots();
     this.emit('broadcast', this.getFullBroadcast('FULL_STATE'));
@@ -570,20 +678,22 @@ export class EngineManager extends EventEmitter {
       this.configs.PE_OPTION.lotSize = peInfo.lotSize;
     }
 
-    if (this.dhan.wsConnected) {
-      const subList = ALL_KEYS.filter((k) => !this.configs[k].securityId.startsWith('SIM_')).map(
-        (k) => ({
-          ExchangeSegment: this.configs[k].exchangeSegment,
-          SecurityId: this.configs[k].securityId,
-        })
-      );
-      this.dhan.updateSubscriptions(subList);
+    // Keep settings.expiry aligned to active resolved contract expiry if placeholder didn't match
+    const resolvedExpiry = ceInfo?.expiry ?? peInfo?.expiry;
+    if (resolvedExpiry && resolvedExpiry !== this.settings.expiry) {
+      this.settings.expiry = resolvedExpiry;
+      this.store.saveSettings(this.settings);
+    }
+
+    if (this.dhan.wsConnected || this.dhan.transportMode !== 'IDLE') {
+      this.dhan.updateSubscriptions(this.getActiveSubscriptions());
     }
   }
 
   public switchToSimulator(): DhanStatus {
     this.dhan.disconnect(true);
     this.mode = 'SIMULATOR';
+    this.lastSeenCumVolume = {};
     this.configs = this.buildInstrumentConfigs();
     this.seedSimulatorHistory(this.settings.simScenario);
     this.startSimulatorLoop();
@@ -603,6 +713,7 @@ export class EngineManager extends EventEmitter {
       hasCredentials: this.dhan.hasCredentials(),
       clientIdMasked: this.dhan.getClientIdMasked(),
       wsConnected: this.dhan.wsConnected,
+      feedTransport: this.dhan.transportMode,
       lastTickAt: this.dhan.lastTickAt,
       lastError: this.dhan.lastError,
       scripCountLoaded: this.dhan.getScripCount(),
@@ -613,9 +724,22 @@ export class EngineManager extends EventEmitter {
   public getFullBroadcast(type: 'FULL_STATE' | 'TICK_UPDATE' = 'FULL_STATE'): RadarBroadcast {
     const streams = {} as Record<StreamKey, StreamPayload>;
     for (const key of ALL_KEYS) {
-      const displayCandles = aggregateCandles(this.candles5s[key], this.settings.timeframe).slice(
-        -180
-      );
+      let displayCandles = aggregateCandles(this.candles5s[key], this.settings.timeframe);
+      if (
+        this.mode === 'DHAN_LIVE' &&
+        this.settings.timeframe === '1m' &&
+        this.bootstrap1m[key].length > 0
+      ) {
+        const firstLiveTime = displayCandles[0]?.time ?? Infinity;
+        const prefix = enrichWithProbabilityLine(
+          this.bootstrap1m[key].filter((b) => b.time < firstLiveTime),
+          this.settings.windowMinutes,
+          this.configs[key].tickSize
+        );
+        displayCandles = [...prefix, ...displayCandles];
+      }
+      displayCandles = displayCandles.slice(-180);
+
       streams[key] = {
         config: this.configs[key],
         candles: displayCandles,

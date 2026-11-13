@@ -151,7 +151,9 @@ export function App() {
             <span className="dot" />
             {dhanStatus.mode === 'DHAN_LIVE'
               ? dhanStatus.wsConnected
-                ? 'DHANHQ LIVE'
+                ? dhanStatus.feedTransport === 'REST_QUOTE'
+                  ? 'DHANHQ LIVE (REST 1s)'
+                  : 'DHANHQ LIVE'
                 : 'DHAN RECONNECTING'
               : 'SIMULATOR MODE'}
             {!connected && ' (WS OFFLINE)'}

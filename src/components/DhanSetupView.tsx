@@ -31,7 +31,7 @@ export function DhanSetupView({
       await onConnect(clientId, accessToken);
       setFeedback({
         type: 'ok',
-        msg: 'DhanHQ v2 WebSocket live feed connected and subscribed to Bank Nifty, Nifty 50, CE & PE.',
+        msg: 'DhanHQ v2 live market feed activated and subscribed to Bank Nifty, Nifty 50, CE & PE.',
       });
     } catch (err) {
       setFeedback({
@@ -56,19 +56,27 @@ export function DhanSetupView({
     }
   };
 
+  const transportLabel =
+    dhanStatus.mode !== 'DHAN_LIVE'
+      ? 'STANDBY'
+      : dhanStatus.wsConnected
+        ? dhanStatus.feedTransport === 'REST_QUOTE'
+          ? 'LIVE (REST 1s)'
+          : 'LIVE (WS v2)'
+        : 'RECONNECTING';
+
   return (
     <div className="setup-grid">
       <div className="panel-surface">
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px' }}>
           <PlugZap size={16} className="text-bull" />
-          <h2 style={{ margin: 0, fontSize: '15px' }}>DhanHQ v2 Live WebSocket Connector</h2>
+          <h2 style={{ margin: 0, fontSize: '15px' }}>DhanHQ v2 Live Connector</h2>
         </div>
 
         <p style={{ fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '14px' }}>
           Connects directly to <code>wss://api-feed.dhan.co?version=2</code> (binary Little-Endian
-          Quote packets) for Bank Nifty Spot (<code>IDX_I:25</code>), Nifty 50 Spot (
-          <code>IDX_I:13</code>), and auto-resolves your chosen Bank Nifty CE &amp; PE strike
-          Security IDs from Dhan&apos;s Scrip Master CSV.
+          Quote packets) with automatic fallback to <code>/v2/marketfeed/quote</code> (1s polling) if
+          a network proxy blocks WebSocket upgrades. Resolves strikes from Dhan&apos;s Scrip Master CSV.
         </p>
 
         <div className="kpi-grid tabular" style={{ marginBottom: '14px' }}>
@@ -82,12 +90,12 @@ export function DhanSetupView({
             </div>
           </div>
           <div className="kpi-box">
-            <div className="kpi-label">WebSocket Status</div>
+            <div className="kpi-label">Feed Transport</div>
             <div
               className={`kpi-value ${dhanStatus.wsConnected ? 'text-bull' : ''}`}
               style={{ fontSize: '15px' }}
             >
-              {dhanStatus.wsConnected ? 'CONNECTED' : 'STANDBY'}
+              {transportLabel}
             </div>
           </div>
           <div className="kpi-box">

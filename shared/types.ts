@@ -147,11 +147,14 @@ export interface RadarSettings {
   simPaused: boolean;
 }
 
+export type FeedTransportMode = 'IDLE' | 'WEBSOCKET' | 'REST_QUOTE';
+
 export interface DhanStatus {
   mode: DataSourceMode;
   hasCredentials: boolean;
   clientIdMasked: string;
   wsConnected: boolean;
+  feedTransport?: FeedTransportMode;
   lastTickAt: number | null;
   lastError: string | null;
   scripCountLoaded: number;

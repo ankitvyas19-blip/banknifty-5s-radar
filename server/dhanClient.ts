@@ -1,5 +1,7 @@
 import { EventEmitter } from 'node:events';
+import https from 'node:https';
 import WebSocket from 'ws';
+import type { Candle, FeedTransportMode } from '../shared/types.js';
 
 export interface DhanTickEvent {
   exchangeSegmentByte: number;
@@ -27,10 +29,22 @@ export interface DhanCredentials {
   accessToken: string;
 }
 
+export interface SubscribedInstrument {
+  ExchangeSegment: 'IDX_I' | 'NSE_FNO';
+  SecurityId: string;
+}
+
 const SEGMENT_ENUM_TO_NAME: Record<number, DhanTickEvent['exchangeSegment']> = {
   0: 'IDX_I',
   1: 'NSE_EQ',
   2: 'NSE_FNO',
+};
+
+const SEGMENT_NAME_TO_ENUM: Record<DhanTickEvent['exchangeSegment'], number> = {
+  IDX_I: 0,
+  NSE_EQ: 1,
+  NSE_FNO: 2,
+  OTHER: 255,
 };
 
 const DISCONNECT_REASONS: Record<number, string> = {
@@ -67,20 +81,117 @@ function parseCsvRow(line: string): string[] {
   return result;
 }
 
+/**
+ * Parses Dhan IST `DD/MM/YYYY HH:mm:ss` strings or Unix timestamps into Unix epoch seconds.
+ */
+export function parseDhanLttToUnixSec(
+  ltt: unknown,
+  nowSec = Math.floor(Date.now() / 1000)
+): number {
+  if (typeof ltt === 'number' && Number.isFinite(ltt) && ltt > 1_000_000_000) {
+    return Math.floor(ltt);
+  }
+  if (typeof ltt === 'string') {
+    const trimmed = ltt.trim();
+    const match = /^(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2}):(\d{2})$/.exec(trimmed);
+    if (match) {
+      const [, dd, mm, yyyy, hh, mi, ss] = match;
+      const parsedMs = Date.parse(`${yyyy}-${mm}-${dd}T${hh}:${mi}:${ss}+05:30`);
+      if (Number.isFinite(parsedMs) && parsedMs > 1_000_000_000_000) {
+        return Math.floor(parsedMs / 1000);
+      }
+    }
+    const numeric = Number(trimmed);
+    if (Number.isFinite(numeric) && numeric > 1_000_000_000) {
+      return Math.floor(numeric);
+    }
+  }
+  return nowSec;
+}
+
+/**
+ * Normalizes a `/v2/marketfeed/quote` JSON payload into strongly typed ticks + previous closes.
+ */
+export function normalizeMarketQuoteResponse(
+  json: unknown,
+  nowSec = Math.floor(Date.now() / 1000)
+): {
+  ticks: DhanTickEvent[];
+  prevCloses: Array<{
+    exchangeSegment: 'IDX_I' | 'NSE_FNO';
+    securityId: string;
+    prevClose: number;
+  }>;
+} {
+  const ticks: DhanTickEvent[] = [];
+  const prevCloses: Array<{
+    exchangeSegment: 'IDX_I' | 'NSE_FNO';
+    securityId: string;
+    prevClose: number;
+  }> = [];
+
+  if (!json || typeof json !== 'object') {
+    return { ticks, prevCloses };
+  }
+
+  const root = json as { data?: Record<string, Record<string, Record<string, unknown>>> };
+  const data = root.data;
+  if (!data || typeof data !== 'object') {
+    return { ticks, prevCloses };
+  }
+
+  for (const segment of ['IDX_I', 'NSE_FNO'] as const) {
+    const bucket = data[segment];
+    if (!bucket || typeof bucket !== 'object') continue;
+
+    for (const [securityId, rawQuote] of Object.entries(bucket)) {
+      if (!rawQuote || typeof rawQuote !== 'object') continue;
+      const ltp = Number(rawQuote.last_price);
+      if (!Number.isFinite(ltp) || ltp <= 0) continue;
+
+      const lttSec = parseDhanLttToUnixSec(rawQuote.last_trade_time, nowSec);
+      const rawVol = Number(rawQuote.volume);
+      const rawOi = Number(rawQuote.oi);
+      const ohlc = rawQuote.ohlc as { close?: unknown } | undefined;
+      const rawPrevClose = Number(ohlc?.close);
+      const prevClose = Number.isFinite(rawPrevClose) && rawPrevClose > 0 ? rawPrevClose : undefined;
+
+      if (prevClose != null) {
+        prevCloses.push({ exchangeSegment: segment, securityId, prevClose });
+      }
+
+      ticks.push({
+        exchangeSegmentByte: SEGMENT_NAME_TO_ENUM[segment],
+        exchangeSegment: segment,
+        securityId,
+        ltp,
+        lttSec,
+        volume: Number.isFinite(rawVol) && rawVol >= 0 ? rawVol : undefined,
+        oi: Number.isFinite(rawOi) && rawOi >= 0 ? rawOi : undefined,
+        prevClose,
+      });
+    }
+  }
+
+  return { ticks, prevCloses };
+}
+
 export class DhanClient extends EventEmitter {
   private credentials: DhanCredentials | null = null;
   private ws: WebSocket | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private restPollTimer: NodeJS.Timeout | null = null;
+  private restPollInFlight = false;
   private isIntentionalClose = false;
-  private subscribedInstruments: Array<{
-    ExchangeSegment: 'IDX_I' | 'NSE_FNO';
-    SecurityId: string;
-  }> = [];
+  private wsFailureCount = 0;
+  private subscribedInstruments: SubscribedInstrument[] = [];
+  private prevCloseCache = new Map<string, number>();
 
   private optionContracts: OptionContractInfo[] = [];
   private scripLoadedAt = 0;
 
   public wsConnected = false;
+  public transportMode: FeedTransportMode = 'IDLE';
   public lastTickAt: number | null = null;
   public lastError: string | null = null;
 
@@ -287,17 +398,212 @@ export class DhanClient extends EventEmitter {
     return candidates[0];
   }
 
-  public connect(
-    instruments: Array<{ ExchangeSegment: 'IDX_I' | 'NSE_FNO'; SecurityId: string }>
-  ): void {
+  /**
+   * Fetches today's recent 1-minute NSE intraday candles via Dhan REST API
+   * so `prev1mLow` & `atr1m` are accurate immediately on live startup.
+   */
+  public async fetchRecent1mCandles(params: {
+    exchangeSegment: 'IDX_I' | 'NSE_FNO';
+    securityId: string;
+    instrument: 'INDEX' | 'OPTIDX';
+    limit?: number;
+  }): Promise<Candle[]> {
+    if (!this.credentials || params.securityId.startsWith('SIM_')) return [];
+
+    const todayIst = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    const fromDate = `${todayIst} 09:15:00`;
+    const toDate = `${todayIst} 15:30:00`;
+
+    try {
+      const res = await fetch('https://api.dhan.co/v2/charts/intraday', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'access-token': this.credentials.accessToken,
+          'client-id': this.credentials.clientId,
+        },
+        body: JSON.stringify({
+          securityId: params.securityId,
+          exchangeSegment: params.exchangeSegment,
+          instrument: params.instrument,
+          interval: '1',
+          oi: false,
+          fromDate,
+          toDate,
+        }),
+      });
+      if (!res.ok) return [];
+
+      const json = (await res.json()) as {
+        timestamp?: number[];
+        open?: number[];
+        high?: number[];
+        low?: number[];
+        close?: number[];
+        volume?: number[];
+      };
+
+      const ts = json.timestamp;
+      if (!Array.isArray(ts) || ts.length === 0) return [];
+
+      const out: Candle[] = [];
+      for (let i = 0; i < ts.length; i++) {
+        const time = Number(ts[i]);
+        const open = Number(json.open?.[i]);
+        const high = Number(json.high?.[i]);
+        const low = Number(json.low?.[i]);
+        const close = Number(json.close?.[i]);
+        const volume = Number(json.volume?.[i] ?? 0);
+        if (
+          !Number.isFinite(time) ||
+          !Number.isFinite(open) ||
+          !Number.isFinite(high) ||
+          !Number.isFinite(low) ||
+          !Number.isFinite(close)
+        ) {
+          continue;
+        }
+        out.push({
+          time: Math.floor(time / 60) * 60,
+          open,
+          high,
+          low,
+          close,
+          volume: Number.isFinite(volume) ? volume : 0,
+        });
+      }
+
+      const limit = params.limit ?? 15;
+      return out.slice(-limit);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Fetches one live Market Quote batch via Dhan REST v2 (`POST /v2/marketfeed/quote`),
+   * emitting any changed previous closes cleanly.
+   */
+  public async fetchMarketQuotesOnce(
+    instruments: SubscribedInstrument[] = this.subscribedInstruments
+  ): Promise<{
+    ok: boolean;
+    ticks: DhanTickEvent[];
+    statusCode?: number;
+    errorMessage?: string;
+  }> {
+    if (!this.credentials) {
+      return { ok: false, ticks: [], errorMessage: 'Dhan credentials missing' };
+    }
+    if (instruments.length === 0) {
+      return { ok: true, ticks: [] };
+    }
+
+    const body: Record<string, number[]> = {};
+    for (const inst of instruments) {
+      const idNum = Number(inst.SecurityId);
+      if (!Number.isFinite(idNum) || idNum <= 0) continue;
+      if (!body[inst.ExchangeSegment]) body[inst.ExchangeSegment] = [];
+      if (!body[inst.ExchangeSegment].includes(idNum)) {
+        body[inst.ExchangeSegment].push(idNum);
+      }
+    }
+
+    if (Object.keys(body).length === 0) {
+      return { ok: true, ticks: [] };
+    }
+
+    try {
+      const res = await fetch('https://api.dhan.co/v2/marketfeed/quote', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'access-token': this.credentials.accessToken,
+          'client-id': this.credentials.clientId,
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        return {
+          ok: false,
+          ticks: [],
+          statusCode: res.status,
+          errorMessage: `Dhan Market Quote HTTP ${res.status}${text ? `: ${text.slice(0, 140)}` : ''}`,
+        };
+      }
+
+      const json = (await res.json()) as unknown;
+      const { ticks, prevCloses } = normalizeMarketQuoteResponse(json);
+
+      for (const pc of prevCloses) {
+        const cacheKey = `${pc.exchangeSegment}:${pc.securityId}`;
+        if (this.prevCloseCache.get(cacheKey) !== pc.prevClose) {
+          this.prevCloseCache.set(cacheKey, pc.prevClose);
+          this.emit('prevClose', pc);
+        }
+      }
+
+      return { ok: true, ticks, statusCode: res.status };
+    } catch (err) {
+      return {
+        ok: false,
+        ticks: [],
+        errorMessage: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+
+  public connect(instruments: SubscribedInstrument[]): void {
     if (!this.credentials) {
       this.lastError = 'Dhan credentials missing';
       return;
     }
 
+    this.disconnect(false);
     this.subscribedInstruments = instruments;
     this.isIntentionalClose = false;
-    this.disconnect(false);
+    this.wsFailureCount = 0;
+    this.prevCloseCache.clear();
+
+    if (process.env.DHAN_TRANSPORT?.toUpperCase() === 'REST') {
+      this.startRestQuotePolling();
+      return;
+    }
+
+    this.connectWebSocket();
+  }
+
+  private cleanupSocketOnly(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.ws) {
+      const oldWs = this.ws;
+      this.ws = null;
+      try {
+        oldWs.removeAllListeners();
+        oldWs.on('error', () => {
+          // Ignore close/terminate errors emitted while aborting an unestablished handshake
+        });
+        if (oldWs.readyState === WebSocket.OPEN) {
+          oldWs.send(JSON.stringify({ RequestCode: 12 }));
+          oldWs.close();
+        } else if (oldWs.readyState === WebSocket.CONNECTING) {
+          oldWs.terminate();
+        }
+      } catch {
+        // ignore close errors
+      }
+    }
+  }
+
+  private connectWebSocket(): void {
+    if (!this.credentials || this.isIntentionalClose) return;
+
+    this.cleanupSocketOnly();
 
     const url =
       `wss://api-feed.dhan.co?version=2` +
@@ -305,15 +611,41 @@ export class DhanClient extends EventEmitter {
       `&clientId=${encodeURIComponent(this.credentials.clientId)}` +
       `&authType=2`;
 
-    const ws = new WebSocket(url);
+    const hasProxy = Boolean(
+      process.env.HTTPS_PROXY ||
+        process.env.https_proxy ||
+        process.env.HTTP_PROXY ||
+        process.env.http_proxy
+    );
+
+    const ws = hasProxy ? new WebSocket(url, { agent: https.globalAgent }) : new WebSocket(url);
     ws.binaryType = 'nodebuffer';
     this.ws = ws;
 
     ws.on('open', () => {
+      if (this.ws !== ws) return;
+      this.wsFailureCount = 0;
+      this.transportMode = 'WEBSOCKET';
       this.wsConnected = true;
       this.lastError = null;
       this.sendSubscribe(this.subscribedInstruments);
       this.emit('status');
+    });
+
+    ws.on('unexpected-response', (_req, res) => {
+      res.resume();
+      if (this.ws !== ws) return;
+      const status = res.statusCode ?? 0;
+      this.cleanupSocketOnly();
+      if (status === 401) {
+        this.wsConnected = false;
+        this.transportMode = 'IDLE';
+        this.lastError = 'DhanHQ HTTP 401: Invalid or expired Access Token.';
+        this.emit('status');
+        return;
+      }
+      // Proxy/firewall blocking WS upgrades (e.g. HTTP 403): switch cleanly to REST 1s Quote polling
+      this.startRestQuotePolling();
     });
 
     ws.on('message', (data: WebSocket.RawData) => {
@@ -326,36 +658,105 @@ export class DhanClient extends EventEmitter {
     });
 
     ws.on('error', (err) => {
+      if (this.ws !== ws) return;
+      this.wsFailureCount += 1;
       this.lastError = err.message;
+      if (this.wsFailureCount >= 2 && !this.isIntentionalClose) {
+        this.startRestQuotePolling();
+        return;
+      }
       this.emit('status');
     });
 
     ws.on('close', (code, reason) => {
-      this.wsConnected = false;
-      this.emit('status');
-      if (!this.isIntentionalClose) {
-        if (!this.lastError) {
-          this.lastError = `Dhan WebSocket closed (${code}${reason ? `: ${reason.toString()}` : ''})`;
-        }
-        this.reconnectTimer = setTimeout(() => {
-          this.connect(this.subscribedInstruments);
-        }, 3000);
+      if (this.ws !== ws) return;
+      this.ws = null;
+      if (this.isIntentionalClose || this.transportMode === 'REST_QUOTE') {
+        return;
       }
+
+      this.wsConnected = false;
+      this.wsFailureCount += 1;
+      if (!this.lastError) {
+        this.lastError = `Dhan WebSocket closed (${code}${reason ? `: ${reason.toString()}` : ''})`;
+      }
+
+      if (this.wsFailureCount >= 2) {
+        this.startRestQuotePolling();
+        return;
+      }
+
+      this.emit('status');
+      this.reconnectTimer = setTimeout(() => {
+        this.connectWebSocket();
+      }, 1500);
     });
   }
 
-  public updateSubscriptions(
-    instruments: Array<{ ExchangeSegment: 'IDX_I' | 'NSE_FNO'; SecurityId: string }>
-  ): void {
-    this.subscribedInstruments = instruments;
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.sendSubscribe(instruments);
+  private startRestQuotePolling(): void {
+    if (this.isIntentionalClose) return;
+    this.cleanupSocketOnly();
+    this.stopRestPollOnly();
+
+    this.transportMode = 'REST_QUOTE';
+    this.emit('status');
+
+    void this.runRestPollCycle();
+    this.restPollTimer = setInterval(() => {
+      void this.runRestPollCycle();
+    }, 1000);
+  }
+
+  private stopRestPollOnly(): void {
+    if (this.restPollTimer) {
+      clearInterval(this.restPollTimer);
+      this.restPollTimer = null;
+    }
+    this.restPollInFlight = false;
+  }
+
+  private async runRestPollCycle(): Promise<void> {
+    if (this.isIntentionalClose || this.transportMode !== 'REST_QUOTE' || this.restPollInFlight) {
+      return;
+    }
+
+    this.restPollInFlight = true;
+    try {
+      const res = await this.fetchMarketQuotesOnce(this.subscribedInstruments);
+      if (this.isIntentionalClose || this.transportMode !== 'REST_QUOTE') return;
+
+      if (res.ok) {
+        const stateChanged = !this.wsConnected || this.lastError !== null;
+        this.wsConnected = true;
+        this.lastError = null;
+        if (res.ticks.length > 0) {
+          this.lastTickAt = Date.now();
+          this.emit('ticks', res.ticks);
+        }
+        if (stateChanged) {
+          this.emit('status');
+        }
+      } else if (res.statusCode !== 429) {
+        // Keep trying on transient rate limits, but surface real auth/network failures
+        this.wsConnected = false;
+        this.lastError = res.errorMessage ?? 'Dhan REST Market Quote polling failed';
+        this.emit('status');
+      }
+    } finally {
+      this.restPollInFlight = false;
     }
   }
 
-  private sendSubscribe(
-    instruments: Array<{ ExchangeSegment: 'IDX_I' | 'NSE_FNO'; SecurityId: string }>
-  ): void {
+  public updateSubscriptions(instruments: SubscribedInstrument[]): void {
+    this.subscribedInstruments = instruments;
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.sendSubscribe(instruments);
+    } else if (this.transportMode === 'REST_QUOTE') {
+      void this.runRestPollCycle();
+    }
+  }
+
+  private sendSubscribe(instruments: SubscribedInstrument[]): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN || instruments.length === 0) return;
 
     // RequestCode 17 = Subscribe Quote Packet (includes LTP, LTQ, LTT, ATP, Volume, Day OHLC)
@@ -373,21 +774,9 @@ export class DhanClient extends EventEmitter {
 
   public disconnect(intentional = true): void {
     this.isIntentionalClose = intentional;
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    if (this.ws) {
-      try {
-        if (this.ws.readyState === WebSocket.OPEN) {
-          this.ws.send(JSON.stringify({ RequestCode: 12 }));
-        }
-        this.ws.close();
-      } catch {
-        // ignore close errors
-      }
-      this.ws = null;
-    }
+    this.stopRestPollOnly();
+    this.cleanupSocketOnly();
+    this.transportMode = 'IDLE';
     this.wsConnected = false;
     this.emit('status');
   }

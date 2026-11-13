@@ -137,7 +137,9 @@ export function enrichWithProbabilityLine(
       }
     }
 
-    const higherLowRatio = totalSteps > 0 ? higherLowCount / totalSteps : 0.5;
+    const rawHigherLowRatio = totalSteps > 0 ? higherLowCount / totalSteps : 0.5;
+    const sampleWeight = Math.min(1, totalSteps / 6);
+    const higherLowRatio = sampleWeight * rawHigherLowRatio + (1 - sampleWeight) * 0.5;
     const atr = Math.max(tickSize * 2, computeATR(win, 12));
     const prevLine = enriched.length > 0 ? (enriched[enriched.length - 1].probLine ?? probLine) : probLine;
     const lineSlope = probLine - prevLine;
@@ -196,6 +198,7 @@ export interface ComputeSnapshotParams {
   tickSize: number;
   prevLocked50s?: RadarSnapshot['locked50s'];
   prevLocked55s?: RadarSnapshot['locked55s'];
+  bootstrap1m?: Candle[];
 }
 
 export function computeRadarSnapshot(params: ComputeSnapshotParams): RadarSnapshot {
@@ -209,6 +212,7 @@ export function computeRadarSnapshot(params: ComputeSnapshotParams): RadarSnapsh
     tickSize,
     prevLocked50s,
     prevLocked55s,
+    bootstrap1m,
   } = params;
 
   const enriched = enrichWithProbabilityLine(candles5s, windowMinutes, tickSize);
@@ -239,12 +243,22 @@ export function computeRadarSnapshot(params: ComputeSnapshotParams): RadarSnapsh
   const stdDevHigh5s = stdDev(highSteps5s);
   const atr5s = computeATR(recent5s, 14);
 
-  // Build 1-minute bars from all available 5s bars (typically 3m to 60m buffer)
-  const bars1m = aggregateCandles(enriched, '1m');
-  const forming1m = bars1m[bars1m.length - 1] ?? latest;
-  const prev1m = bars1m.length >= 2 ? bars1m[bars1m.length - 2] : forming1m;
+  // Build 1-minute bars from all available 5s bars, optionally prepending closed intraday 1m context
+  const live1m = aggregateCandles(enriched, '1m');
+  const firstLiveMin = live1m[0]?.time ?? Infinity;
+  const liveMinSet = new Set(live1m.map((b) => b.time));
+  const prefix1m = (bootstrap1m ?? []).filter(
+    (b) => b.time < firstLiveMin && !liveMinSet.has(b.time)
+  );
+  const bars1m = [...prefix1m, ...live1m].sort((a, b) => a.time - b.time);
 
-  const recent1m = bars1m.slice(-Math.max(4, windowMinutes + 1));
+  const forming1m = live1m[live1m.length - 1] ?? latest;
+  const prev1m =
+    live1m.length >= 2
+      ? live1m[live1m.length - 2]
+      : (prefix1m[prefix1m.length - 1] ?? forming1m);
+
+  const recent1m = (live1m.length > 0 ? bars1m : prefix1m).slice(-Math.max(4, windowMinutes + 1));
   const lowSteps1m: number[] = [];
   const highSteps1m: number[] = [];
   for (let i = 1; i < recent1m.length; i++) {
@@ -256,7 +270,10 @@ export function computeRadarSnapshot(params: ComputeSnapshotParams): RadarSnapsh
   const highDev1m = round2(forming1m.high - prev1m.high);
   const avgLowDev1m = lowSteps1m.length > 0 ? mean(lowSteps1m) : avgStepLow5s * 12;
   const avgHighDev1m = highSteps1m.length > 0 ? mean(highSteps1m) : avgStepHigh5s * 12;
-  const atr1m = bars1m.length >= 2 ? computeATR(bars1m, Math.max(3, windowMinutes)) : atr5s * Math.sqrt(12);
+  const atr1m =
+    bars1m.length >= 2
+      ? computeATR(bars1m, Math.max(3, windowMinutes))
+      : atr5s * Math.sqrt(12);
 
   // Blend 1m Low-to-Low StdDev with 5s-scaled StdDev (sqrt(12) scaling rule from 5s to 60s)
   const scaled5sStdLow = stdDevLow5s * Math.sqrt(12);

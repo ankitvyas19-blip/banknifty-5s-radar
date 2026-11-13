@@ -5,7 +5,11 @@ import {
   runBacktestOn5sCandles,
 } from '../shared/radarMath.js';
 import type { Candle } from '../shared/types.js';
-import { DhanClient } from '../server/dhanClient.js';
+import {
+  DhanClient,
+  normalizeMarketQuoteResponse,
+  parseDhanLttToUnixSec,
+} from '../server/dhanClient.js';
 
 // 1. Verify Bank Nifty 61360.45 -> 61368.00 bullish 1m low deviation & :55s early snapshot
 const baseSec = 1794580320; // aligned minute
@@ -202,4 +206,100 @@ console.log('✓ Test 5 passed: Realistic 25m Simulator Backtest:', {
   supportHoldRatePct: simBt.supportHoldRatePct,
   directionHitRatePct: simBt.directionHitRatePct,
 });
+
+// 6. Verify 1-bar initial startup safety + bootstrap1m lowDev1m accuracy
+const singleBar: Candle[] = [
+  {
+    time: baseSec + 60,
+    open: 61045,
+    high: 61048,
+    low: 61042,
+    close: 61047,
+    volume: 10,
+  },
+];
+const singleSnapNoBoot = computeRadarSnapshot({
+  key: 'BANKNIFTY_SPOT',
+  candles5s: singleBar,
+  prevDayClose: 61518.5,
+  nowMs: (baseSec + 60 + 2) * 1000,
+  windowMinutes: 3,
+  stdDevMultiplier: 1.0,
+  tickSize: 0.05,
+});
+assert.ok(Number.isFinite(singleSnapNoBoot.predictedNextSupport));
+assert.ok(Number.isFinite(singleSnapNoBoot.predictedNextResistance));
+assert.ok(singleSnapNoBoot.predictedNextSupport < singleSnapNoBoot.predictedNextResistance);
+
+const bootstrapPrev: Candle[] = [
+  {
+    time: baseSec,
+    open: 61030,
+    high: 61050,
+    low: 61032.5,
+    close: 61044,
+    volume: 500,
+  },
+];
+const singleSnapWithBoot = computeRadarSnapshot({
+  key: 'BANKNIFTY_SPOT',
+  candles5s: singleBar,
+  prevDayClose: 61518.5,
+  nowMs: (baseSec + 60 + 2) * 1000,
+  windowMinutes: 3,
+  stdDevMultiplier: 1.0,
+  tickSize: 0.05,
+  bootstrap1m: bootstrapPrev,
+});
+assert.equal(singleSnapWithBoot.lowDev1m, 9.5, 'Expected 61042 - 61032.5 = 9.50 using bootstrap1m');
+assert.ok(singleSnapWithBoot.predictedNextSupport < singleSnapWithBoot.predictedNextResistance);
+console.log('✓ Test 6 passed: 1-bar live warm-up + bootstrap1m lowDev1m:', {
+  lowDev1m: singleSnapWithBoot.lowDev1m,
+  support: singleSnapWithBoot.predictedNextSupport,
+  resistance: singleSnapWithBoot.predictedNextResistance,
+});
+
+// 7. Verify Dhan Market Quote response normalization & IST LTT parsing
+const parsedIstSec = parseDhanLttToUnixSec('13/11/2026 09:47:17', 999);
+assert.equal(parsedIstSec, Math.floor(Date.parse('2026-11-13T09:47:17+05:30') / 1000));
+const staleFallback = parseDhanLttToUnixSec('01/01/1980 00:00:00', 1794543439);
+assert.equal(staleFallback, 1794543439);
+
+const normalized = normalizeMarketQuoteResponse(
+  {
+    status: 'success',
+    data: {
+      IDX_I: {
+        '25': {
+          last_price: 61044.7,
+          last_trade_time: '13/11/2026 09:47:17',
+          volume: 0,
+          oi: 0,
+          ohlc: { open: 61300.55, close: 61518.5, high: 61300.55, low: 60862.2 },
+        },
+      },
+      NSE_FNO: {
+        '62341': {
+          last_price: 519.8,
+          last_trade_time: '13/11/2026 09:47:13',
+          volume: 335340,
+          oi: 232410,
+          ohlc: { open: 740.35, close: 754.65, high: 740.35, low: 454.95 },
+        },
+      },
+    },
+  },
+  1794543439
+);
+assert.equal(normalized.ticks.length, 2);
+assert.equal(normalized.prevCloses.length, 2);
+const bnQuoteTick = normalized.ticks.find((t) => t.securityId === '25');
+const ceQuoteTick = normalized.ticks.find((t) => t.securityId === '62341');
+assert.equal(bnQuoteTick?.ltp, 61044.7);
+assert.equal(bnQuoteTick?.prevClose, 61518.5);
+assert.equal(ceQuoteTick?.ltp, 519.8);
+assert.equal(ceQuoteTick?.volume, 335340);
+assert.equal(ceQuoteTick?.oi, 232410);
+console.log('✓ Test 7 passed: Dhan REST Quote normalization & IST LTT parsing.');
+
 
