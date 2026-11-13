@@ -3,14 +3,19 @@ import {
   Activity,
   AlertTriangle,
   BarChart3,
+  CheckCircle2,
   Clock,
+  Crosshair,
   Pause,
   Play,
   PlugZap,
   RotateCcw,
   Settings2,
+  ShieldAlert,
+  ShieldCheck,
+  XCircle,
 } from 'lucide-react';
-import type { SimScenario, StreamKey, Timeframe } from '../shared/types.js';
+import type { ConfluenceSideEvaluation, SimScenario, StreamKey, Timeframe } from '../shared/types.js';
 import { BacktestView } from './components/BacktestView.js';
 import { DhanSetupView } from './components/DhanSetupView.js';
 import { RadarPanel } from './components/RadarPanel.js';
@@ -26,14 +31,18 @@ export function App() {
     connected,
     error,
     updateSettings,
+    snapToAtm,
     reseedScenario,
     connectDhanLive,
     disconnectDhanLive,
     runBacktest,
+    runStrategyBacktest,
     fetchExpiries,
   } = useRadarSocket();
 
   const [tab, setTab] = useState<ActiveTab>('RADAR');
+  const [inputWarning, setInputWarning] = useState<string | null>(null);
+  const [snappingAtm, setSnappingAtm] = useState(false);
 
   // Local input drafts for strike & entry price so typing feels instantaneous
   const [drafts, setDrafts] = useState<{
@@ -57,8 +66,9 @@ export function App() {
     );
   }
 
-  const { settings, dhanStatus, streams } = state;
+  const { settings, dhanStatus, streams, confluence } = state;
   const mainSnap = streams.BANKNIFTY_SPOT.snapshot;
+  const suggestedAtm = confluence?.suggestedAtmStrike ?? Math.round(mainSnap.ltp / 100) * 100;
 
   const ceStrikeDraft = drafts.ceStrike ?? String(settings.ceStrike);
   const peStrikeDraft = drafts.peStrike ?? String(settings.peStrike);
@@ -69,19 +79,53 @@ export function App() {
   const expiryDraft = drafts.expiry ?? settings.expiry;
 
   const applyStrikesAndTrades = async () => {
+    setInputWarning(null);
     const ceStrike = Number(ceStrikeDraft);
     const peStrike = Number(peStrikeDraft);
     const ceEntryPrice = ceEntryDraft.trim() === '' ? null : Number(ceEntryDraft);
     const peEntryPrice = peEntryDraft.trim() === '' ? null : Number(peEntryDraft);
 
+    if (
+      (ceEntryPrice != null && ceEntryPrice >= 15000) ||
+      (peEntryPrice != null && peEntryPrice >= 15000)
+    ) {
+      setInputWarning(
+        'CE/PE Entry ₹ me Option Premium price (e.g. 240 ya 680) daalein — 61000 jaisa Strike price nahi!'
+      );
+      return;
+    }
+
     await updateSettings({
       ceStrike: Number.isFinite(ceStrike) && ceStrike > 0 ? ceStrike : settings.ceStrike,
       peStrike: Number.isFinite(peStrike) && peStrike > 0 ? peStrike : settings.peStrike,
-      ceEntryPrice: ceEntryPrice != null && Number.isFinite(ceEntryPrice) ? ceEntryPrice : null,
-      peEntryPrice: peEntryPrice != null && Number.isFinite(peEntryPrice) ? peEntryPrice : null,
+      ceEntryPrice:
+        ceEntryPrice != null && Number.isFinite(ceEntryPrice) && ceEntryPrice > 0
+          ? ceEntryPrice
+          : null,
+      peEntryPrice:
+        peEntryPrice != null && Number.isFinite(peEntryPrice) && peEntryPrice > 0
+          ? peEntryPrice
+          : null,
       expiry: expiryDraft.trim() || settings.expiry,
     });
     setDrafts({});
+  };
+
+  const handleSnapAtm = async () => {
+    setInputWarning(null);
+    setSnappingAtm(true);
+    try {
+      await snapToAtm();
+      setDrafts((d) => ({
+        ...d,
+        ceStrike: undefined,
+        peStrike: undefined,
+      }));
+    } catch (err) {
+      setInputWarning(err instanceof Error ? err.message : 'Failed to snap ATM strike');
+    } finally {
+      setSnappingAtm(false);
+    }
   };
 
   const phaseClass =
@@ -90,6 +134,25 @@ export function App() {
       : mainSnap.phase === 'EARLY_50S'
         ? 'phase-early'
         : '';
+
+  const activeSideEval: ConfluenceSideEvaluation | null = confluence
+    ? confluence.direction === 'CE'
+      ? confluence.ceEval
+      : confluence.direction === 'PE'
+        ? confluence.peEval
+        : mainSnap.bullishPct >= 50
+          ? confluence.ceEval
+          : confluence.peEval
+    : null;
+
+  const confluenceCls =
+    confluence?.verdict === 'A_PLUS_CE'
+      ? 'conf-ce'
+      : confluence?.verdict === 'A_PLUS_PE'
+        ? 'conf-pe'
+        : confluence?.verdict === 'WATCH_CE' || confluence?.verdict === 'WATCH_PE'
+          ? 'conf-watch'
+          : 'conf-chop';
 
   return (
     <div className="app-shell">
@@ -102,7 +165,7 @@ export function App() {
           <div>
             <h1 className="brand-title">BANKNIFTY · 5s SCALP RADAR</h1>
             <div className="brand-sub">
-              3-Min Rolling StdDev &amp; ATR Early Support/Resistance Engine
+              3-Min Rolling StdDev, VWAP &amp; 3-Way Confluence Engine
             </div>
           </div>
         </div>
@@ -120,7 +183,7 @@ export function App() {
             onClick={() => setTab('BACKTEST')}
           >
             <BarChart3 size={14} />
-            Backtest &amp; Accuracy
+            Strategy &amp; Backtest
           </button>
           <button
             className={`nav-tab ${tab === 'SETUP' ? 'active' : ''}`}
@@ -190,6 +253,18 @@ export function App() {
           </div>
           <button className="btn" onClick={() => setTab('SETUP')}>
             Check Token / Setup →
+          </button>
+        </div>
+      )}
+
+      {inputWarning && (
+        <div className="mode-alert-bar err" role="alert">
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <AlertTriangle size={15} />
+            <span>{inputWarning}</span>
+          </div>
+          <button className="btn" onClick={() => setInputWarning(null)}>
+            Dismiss
           </button>
         </div>
       )}
@@ -264,6 +339,16 @@ export function App() {
 
           <button className="btn btn-primary" onClick={() => void applyStrikesAndTrades()}>
             Apply Trade
+          </button>
+
+          <button
+            className="btn btn-ice tabular"
+            onClick={() => void handleSnapAtm()}
+            disabled={snappingAtm}
+            title="Auto-switch CE & PE to Bank Nifty's nearest At-The-Money (ATM) strike"
+          >
+            <Crosshair size={13} />
+            {snappingAtm ? 'Snapping...' : `Snap ATM (${suggestedAtm})`}
           </button>
         </div>
 
@@ -359,15 +444,61 @@ export function App() {
       {/* Main View Switcher */}
       <main className="main-content">
         {tab === 'RADAR' && (
-          <div className="radar-grid">
-            {STREAM_ORDER.map((key) => (
-              <RadarPanel
-                key={key}
-                stream={streams[key]}
-                timeframe={settings.timeframe}
-              />
-            ))}
-          </div>
+          <>
+            {confluence && activeSideEval && (
+              <section
+                className={`confluence-bar ${confluenceCls}`}
+                aria-label="3-Way Confluence Decision"
+              >
+                <div className="conf-top">
+                  <div className="conf-headline-wrap">
+                    {confluence.verdict === 'A_PLUS_CE' || confluence.verdict === 'A_PLUS_PE' ? (
+                      <ShieldCheck size={18} />
+                    ) : (
+                      <ShieldAlert size={18} />
+                    )}
+                    <div>
+                      <div className="conf-headline">{confluence.headline}</div>
+                      <div className="conf-subline tabular">{confluence.subline}</div>
+                    </div>
+                  </div>
+
+                  <div className="conf-scores tabular">
+                    <span className="tag" title="Call Confluence Score">
+                      CE {confluence.ceEval.score}/5
+                    </span>
+                    <span className="tag" title="Put Confluence Score">
+                      PE {confluence.peEval.score}/5
+                    </span>
+                  </div>
+                </div>
+
+                <div className="conf-checks tabular">
+                  {activeSideEval.checks.map((chk) => (
+                    <div
+                      key={chk.id}
+                      className={`conf-pill ${chk.passed ? 'ok' : 'no'}`}
+                      title={chk.detail}
+                    >
+                      {chk.passed ? <CheckCircle2 size={12} /> : <XCircle size={12} />}
+                      <span>{chk.label}:</span>
+                      <strong>{chk.detail}</strong>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
+
+            <div className="radar-grid">
+              {STREAM_ORDER.map((key) => (
+                <RadarPanel
+                  key={key}
+                  stream={streams[key]}
+                  timeframe={settings.timeframe}
+                />
+              ))}
+            </div>
+          </>
         )}
 
         {tab === 'BACKTEST' && (
@@ -375,7 +506,10 @@ export function App() {
             defaultWindow={settings.windowMinutes}
             defaultMultiplier={settings.stdDevMultiplier}
             defaultTrigger={settings.earlyTriggerSecond}
+            ceSymbol={streams.CE_OPTION.config.symbol}
+            peSymbol={streams.PE_OPTION.config.symbol}
             onRunBacktest={runBacktest}
+            onRunStrategyBacktest={runStrategyBacktest}
           />
         )}
 

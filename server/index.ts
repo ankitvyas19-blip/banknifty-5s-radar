@@ -88,6 +88,17 @@ async function bootstrap(): Promise<void> {
     }
   });
 
+  app.post('/api/strikes/snap-atm', async (_req, res) => {
+    try {
+      const result = await engine.snapToAtmStrikes();
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Failed to snap to ATM strikes',
+      });
+    }
+  });
+
   app.get('/api/backtest', (req, res) => {
     const streamKey = (String(req.query.streamKey || 'BANKNIFTY_SPOT') as StreamKey);
     const windowMinutes = Math.max(1, Math.min(10, Number(req.query.windowMinutes || 3)));
@@ -106,6 +117,47 @@ async function bootstrap(): Promise<void> {
       triggerSecond,
     });
     res.json(summary);
+  });
+
+  app.get('/api/strategy-backtest', async (req, res) => {
+    try {
+      const optionKey =
+        req.query.optionKey === 'CE_OPTION' ? 'CE_OPTION' : 'PE_OPTION';
+      const rawStrat = String(req.query.strategy || 'STRONG_CONFLUENCE');
+      const strategy =
+        rawStrat === 'NAIVE_SR' || rawStrat === 'TREND_SR' || rawStrat === 'STRONG_CONFLUENCE'
+          ? rawStrat
+          : 'STRONG_CONFLUENCE';
+      const lots = Math.max(1, Math.min(50, Math.round(Number(req.query.lots || 1))));
+      const maxTrades = Math.max(1, Math.min(100, Math.round(Number(req.query.maxTrades || 6))));
+      const cooldownMinutes = Math.max(0, Math.min(30, Math.round(Number(req.query.cooldownMinutes ?? 4))));
+      const minCostMult = Math.max(0, Math.min(12, Number(req.query.minCostMult ?? 4.0)));
+      const slAtrMult = Math.max(0.5, Math.min(5, Number(req.query.slAtrMult ?? 1.5)));
+      const trailingEnabled = String(req.query.trailingEnabled ?? 'true') !== 'false';
+      const stdDevMultiplier = Math.max(
+        0.25,
+        Math.min(3.0, Number(req.query.stdDevMultiplier || 1.0))
+      );
+      const source = req.query.source === '5S_TICKS' ? '5S_TICKS' : 'AUTO';
+
+      const summary = await engine.runStrategyBacktest({
+        optionKey,
+        strategy,
+        lots,
+        maxTrades,
+        cooldownMinutes,
+        minCostMult,
+        slAtrMult,
+        trailingEnabled,
+        stdDevMultiplier,
+        source,
+      });
+      res.json(summary);
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Strategy backtest failed',
+      });
+    }
   });
 
   if (!IS_PROD) {

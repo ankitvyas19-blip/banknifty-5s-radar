@@ -1,13 +1,16 @@
 import { EventEmitter } from 'node:events';
 import {
   aggregateCandles,
+  computeConfluenceSignal,
   computeRadarSnapshot,
   enrichWithProbabilityLine,
   runBacktestOn5sCandles,
+  runStrategyBacktest,
 } from '../shared/radarMath.js';
 import type {
   BacktestSummary,
   Candle,
+  ConfluenceSignal,
   DataSourceMode,
   DhanStatus,
   ForecastRecord,
@@ -15,6 +18,8 @@ import type {
   RadarBroadcast,
   RadarSettings,
   RadarSnapshot,
+  StrategyBacktestParams,
+  StrategyBacktestSummary,
   StreamKey,
   StreamPayload,
 } from '../shared/types.js';
@@ -62,6 +67,7 @@ export class EngineManager extends EventEmitter {
   };
   private lastSeenCumVolume: Partial<Record<StreamKey, number>> = {};
   private snapshots: Record<StreamKey, RadarSnapshot> = {} as Record<StreamKey, RadarSnapshot>;
+  private confluence!: ConfluenceSignal;
   private lastPersisted5sTime: Record<StreamKey, number> = {
     BANKNIFTY_SPOT: 0,
     NIFTY_SPOT: 0,
@@ -77,6 +83,7 @@ export class EngineManager extends EventEmitter {
 
   private simTimer: NodeJS.Timeout | null = null;
   private lastClockMs: number = Date.now();
+  private connectPromise: Promise<DhanStatus> | null = null;
 
   constructor(store: RadarStore) {
     super();
@@ -108,7 +115,7 @@ export class EngineManager extends EventEmitter {
       this.settings.simScenario
     );
 
-    // Seed initial simulator data cleanly so snapshots exist immediately
+    // Seed initial simulator data cleanly so snapshots and confluence exist immediately
     this.seedSimulatorHistory(this.settings.simScenario);
 
     this.snapshots = {
@@ -117,6 +124,10 @@ export class EngineManager extends EventEmitter {
       CE_OPTION: this.computeSnapshotFor('CE_OPTION', this.lastClockMs),
       PE_OPTION: this.computeSnapshotFor('PE_OPTION', this.lastClockMs),
     };
+    this.confluence = computeConfluenceSignal({
+      snapshots: this.snapshots,
+      configs: this.configs,
+    });
 
     // Wire DhanHQ live events (both individual binary WS ticks and batched REST ticks)
     this.dhan.on('tick', (tick: DhanTickEvent) => this.handleDhanTickBatch([tick]));
@@ -134,9 +145,14 @@ export class EngineManager extends EventEmitter {
 
     // If DHAN env vars are provided & DHAN_AUTO_CONNECT=true, auto-connect
     if (this.dhan.hasCredentials() && process.env.DHAN_AUTO_CONNECT === 'true') {
-      void this.connectDhanLive().catch((err) => {
-        console.error('[BankNifty 5s Radar] Initial Dhan auto-connect error:', err);
-      });
+      this.connectPromise = this.connectDhanLive()
+        .catch((err) => {
+          console.error('[BankNifty 5s Radar] Initial Dhan auto-connect error:', err);
+          return this.getDhanStatus();
+        })
+        .finally(() => {
+          this.connectPromise = null;
+        });
     } else {
       this.startSimulatorLoop();
     }
@@ -204,7 +220,7 @@ export class EngineManager extends EventEmitter {
       scenario,
       this.settings.ceStrike,
       this.settings.peStrike,
-      25
+      35
     );
 
     this.lastClockMs = seeded.lastSimMs;
@@ -444,6 +460,11 @@ export class EngineManager extends EventEmitter {
         );
       }
     }
+
+    this.confluence = computeConfluenceSignal({
+      snapshots: this.snapshots,
+      configs: this.configs,
+    });
   }
 
   private applyLiveTickToBuffers(tick: DhanTickEvent, nowMs: number): void {
@@ -497,35 +518,33 @@ export class EngineManager extends EventEmitter {
     if (this.mode !== 'DHAN_LIVE') return;
 
     const currentMinuteSec = Math.floor(Date.now() / 60000) * 60;
-    await Promise.all(
-      keys.map(async (key) => {
-        const cfg = this.configs[key];
-        if (cfg.securityId.startsWith('SIM_')) return;
+    for (const key of keys) {
+      const cfg = this.configs[key];
+      if (cfg.securityId.startsWith('SIM_')) continue;
 
-        // Restore any recorded live 5s bars from SQLite first
-        const saved = this.store.getRecentCandles5s(key, cfg.symbol, 'DHAN_LIVE', MAX_MEMORY_5S_BARS);
-        if (saved.length > 0) {
-          this.candles5s[key] = enrichWithProbabilityLine(
-            saved,
-            this.settings.windowMinutes,
-            cfg.tickSize
-          );
-          this.lastPersisted5sTime[key] = saved[saved.length - 1]?.time ?? 0;
-        } else {
-          this.candles5s[key] = [];
-          this.lastPersisted5sTime[key] = 0;
-        }
+      // Restore any recorded live 5s bars from SQLite first
+      const saved = this.store.getRecentCandles5s(key, cfg.symbol, 'DHAN_LIVE', MAX_MEMORY_5S_BARS);
+      if (saved.length > 0) {
+        this.candles5s[key] = enrichWithProbabilityLine(
+          saved,
+          this.settings.windowMinutes,
+          cfg.tickSize
+        );
+        this.lastPersisted5sTime[key] = saved[saved.length - 1]?.time ?? 0;
+      } else {
+        this.candles5s[key] = [];
+        this.lastPersisted5sTime[key] = 0;
+      }
 
-        // Fetch recent completed NSE 1m bars so prev1mLow / atr1m are real immediately
-        const bars1m = await this.dhan.fetchRecent1mCandles({
-          exchangeSegment: cfg.exchangeSegment,
-          securityId: cfg.securityId,
-          instrument: cfg.exchangeSegment === 'IDX_I' ? 'INDEX' : 'OPTIDX',
-          limit: 16,
-        });
-        this.bootstrap1m[key] = bars1m.filter((b) => b.time < currentMinuteSec);
-      })
-    );
+      // Fetch today's completed NSE 1m bars for prev1mLow, EMA9/21, 15m structure, Session VWAP & full-day backtest
+      const bars1m = await this.dhan.fetchRecent1mCandles({
+        exchangeSegment: cfg.exchangeSegment,
+        securityId: cfg.securityId,
+        instrument: cfg.exchangeSegment === 'IDX_I' ? 'INDEX' : 'OPTIDX',
+        limit: 400,
+      });
+      this.bootstrap1m[key] = bars1m.filter((b) => b.time < currentMinuteSec);
+    }
 
     const subs = keys
       .filter((k) => !this.configs[k].securityId.startsWith('SIM_'))
@@ -635,25 +654,33 @@ export class EngineManager extends EventEmitter {
       throw new Error('Please provide both Dhan Client ID and Access Token.');
     }
 
-    this.mode = 'DHAN_LIVE';
-    this.stopSimulatorLoop();
-    this.lastSeenCumVolume = {};
+    const runConnect = async (): Promise<DhanStatus> => {
+      this.mode = 'DHAN_LIVE';
+      this.stopSimulatorLoop();
+      this.lastSeenCumVolume = {};
 
-    for (const key of ALL_KEYS) {
-      this.candles5s[key] = [];
-      this.bootstrap1m[key] = [];
-      this.lastPersisted5sTime[key] = 0;
-      this.lastEvaluated1mSec[key] = 0;
-    }
+      for (const key of ALL_KEYS) {
+        this.candles5s[key] = [];
+        this.bootstrap1m[key] = [];
+        this.lastPersisted5sTime[key] = 0;
+        this.lastEvaluated1mSec[key] = 0;
+      }
 
-    await this.resolveAndSubscribeLiveOptions();
-    await this.warmStreamHistoryFromDhan(ALL_KEYS);
+      await this.resolveAndSubscribeLiveOptions();
+      await this.warmStreamHistoryFromDhan(ALL_KEYS);
 
-    const subList = this.getActiveSubscriptions();
-    this.dhan.connect(subList);
-    this.recomputeAllSnapshots();
-    this.emit('broadcast', this.getFullBroadcast('FULL_STATE'));
-    return this.getDhanStatus();
+      const subList = this.getActiveSubscriptions();
+      this.dhan.connect(subList);
+      this.recomputeAllSnapshots();
+      this.emit('broadcast', this.getFullBroadcast('FULL_STATE'));
+      return this.getDhanStatus();
+    };
+
+    const p = runConnect().finally(() => {
+      if (this.connectPromise === p) this.connectPromise = null;
+    });
+    this.connectPromise = p;
+    return p;
   }
 
   private async resolveAndSubscribeLiveOptions(): Promise<void> {
@@ -758,8 +785,37 @@ export class EngineManager extends EventEmitter {
       serverTimeMs: this.lastClockMs,
       dhanStatus: this.getDhanStatus(),
       settings: this.settings,
+      confluence: this.confluence,
       streams,
     };
+  }
+
+  public async snapToAtmStrikes(): Promise<{ atmStrike: number; state: RadarBroadcast }> {
+    if (this.connectPromise) {
+      await this.connectPromise;
+    }
+
+    if (this.mode === 'DHAN_LIVE' && this.candles5s.BANKNIFTY_SPOT.length === 0) {
+      const freshSpot = await this.dhan.fetchMarketQuotesOnce([
+        { ExchangeSegment: 'IDX_I', SecurityId: '25' },
+      ]);
+      if (freshSpot.ok && freshSpot.ticks.length > 0) {
+        const nowMs = Date.now();
+        this.lastClockMs = nowMs;
+        for (const t of freshSpot.ticks) {
+          this.applyLiveTickToBuffers(t, nowMs);
+        }
+        this.recomputeAllSnapshots();
+      }
+    }
+
+    const bnLtp = this.snapshots.BANKNIFTY_SPOT?.ltp || 61000;
+    const atmStrike = Math.round(bnLtp / 100) * 100;
+    const state = await this.updateSettings({
+      ceStrike: atmStrike,
+      peStrike: atmStrike,
+    });
+    return { atmStrike, state };
   }
 
   public runBacktest(params: {
@@ -781,6 +837,69 @@ export class EngineManager extends EventEmitter {
       stdDevMultiplier: params.stdDevMultiplier,
       triggerSecond: params.triggerSecond,
       tickSize: this.configs[params.streamKey].tickSize,
+    });
+  }
+
+  private async buildSession1mBars(key: StreamKey, prefer5sOnly: boolean): Promise<Candle[]> {
+    const cfg = this.configs[key];
+    const stored5s = this.store.getRecentCandles5s(key, cfg.symbol, this.mode, 10000);
+    const merged5sMap = new Map<number, Candle>();
+    for (const c of stored5s) merged5sMap.set(c.time, c);
+    for (const c of this.candles5s[key]) merged5sMap.set(c.time, c);
+
+    const merged5s = Array.from(merged5sMap.values()).sort((a, b) => a.time - b.time);
+    const live1m = aggregateCandles(merged5s, '1m');
+
+    if (prefer5sOnly || this.mode !== 'DHAN_LIVE') {
+      return live1m;
+    }
+
+    if (this.bootstrap1m[key].length === 0 && !cfg.securityId.startsWith('SIM_')) {
+      const currentMinuteSec = Math.floor(Date.now() / 60000) * 60;
+      const fetched = await this.dhan.fetchRecent1mCandles({
+        exchangeSegment: cfg.exchangeSegment,
+        securityId: cfg.securityId,
+        instrument: cfg.exchangeSegment === 'IDX_I' ? 'INDEX' : 'OPTIDX',
+        limit: 400,
+      });
+      this.bootstrap1m[key] = fetched.filter((b) => b.time < currentMinuteSec);
+    }
+
+    const barMap = new Map<number, Candle>();
+    for (const b of this.bootstrap1m[key]) {
+      barMap.set(b.time, b);
+    }
+    for (const b of live1m) {
+      barMap.set(b.time, b);
+    }
+    return Array.from(barMap.values()).sort((a, b) => a.time - b.time);
+  }
+
+  public async runStrategyBacktest(params: StrategyBacktestParams): Promise<StrategyBacktestSummary> {
+    const prefer5sOnly = params.source === '5S_TICKS';
+    const [bnBars1m, nfBars1m, optBars1m] = await Promise.all([
+      this.buildSession1mBars('BANKNIFTY_SPOT', prefer5sOnly),
+      this.buildSession1mBars('NIFTY_SPOT', prefer5sOnly),
+      this.buildSession1mBars(params.optionKey, prefer5sOnly),
+    ]);
+
+    const optCfg = this.configs[params.optionKey];
+    const dataSourceLabel =
+      this.mode === 'SIMULATOR'
+        ? 'Simulator Synthetic Session (5s→1m, Zero Look-Ahead)'
+        : !prefer5sOnly && this.bootstrap1m[params.optionKey].length > 0
+          ? 'Dhan NSE Intraday 1m Session + Live 5s (Zero Look-Ahead)'
+          : 'Recorded Live 5s→1m Ticks (Zero Look-Ahead)';
+
+    return runStrategyBacktest({
+      params,
+      symbol: optCfg.symbol,
+      lotSize: optCfg.lotSize ?? 30,
+      tickSize: optCfg.tickSize,
+      dataSourceLabel,
+      bnBars1m,
+      nfBars1m,
+      optBars1m,
     });
   }
 }

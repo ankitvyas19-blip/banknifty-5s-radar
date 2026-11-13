@@ -353,6 +353,124 @@ body {
   color: #fda4af;
 }
 
+.btn-ice {
+  background: var(--ice-soft);
+  border-color: rgba(56, 189, 248, 0.4);
+  color: #bae6fd;
+}
+
+.btn-ice:hover {
+  background: rgba(56, 189, 248, 0.22);
+}
+
+/* 3-Way Confluence Decision Engine Bar */
+.confluence-bar {
+  margin-bottom: 14px;
+  padding: 11px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-surface);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.confluence-bar.conf-ce {
+  border-color: rgba(16, 185, 129, 0.55);
+  background: linear-gradient(90deg, rgba(16, 185, 129, 0.14), rgba(15, 21, 29, 0.96));
+}
+
+.confluence-bar.conf-pe {
+  border-color: rgba(56, 189, 248, 0.55);
+  background: linear-gradient(90deg, rgba(56, 189, 248, 0.14), rgba(15, 21, 29, 0.96));
+}
+
+.confluence-bar.conf-watch {
+  border-color: rgba(245, 158, 11, 0.45);
+  background: linear-gradient(90deg, rgba(245, 158, 11, 0.12), rgba(15, 21, 29, 0.96));
+}
+
+.confluence-bar.conf-chop {
+  border-color: rgba(244, 63, 94, 0.35);
+  background: linear-gradient(90deg, rgba(244, 63, 94, 0.1), rgba(15, 21, 29, 0.96));
+}
+
+.conf-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.conf-headline-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.conf-ce .conf-headline-wrap {
+  color: #6ee7b7;
+}
+
+.conf-pe .conf-headline-wrap {
+  color: #7dd3fc;
+}
+
+.conf-watch .conf-headline-wrap {
+  color: #fcd34d;
+}
+
+.conf-chop .conf-headline-wrap {
+  color: #fda4af;
+}
+
+.conf-headline {
+  font-size: 13.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.conf-subline {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-top: 2px;
+}
+
+.conf-scores {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.conf-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.conf-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border-radius: 5px;
+  font-size: 11px;
+  border: 1px solid var(--border-subtle);
+  background: rgba(9, 13, 18, 0.65);
+  color: var(--text-secondary);
+}
+
+.conf-pill.ok {
+  border-color: rgba(16, 185, 129, 0.35);
+  color: #a7f3d0;
+}
+
+.conf-pill.no {
+  border-color: rgba(244, 63, 94, 0.28);
+  color: #fecdd3;
+}
+
 /* Main Content */
 .main-content {
   flex: 1;

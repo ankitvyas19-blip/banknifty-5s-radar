@@ -78,6 +78,7 @@ export function RadarPanel({ stream, timeframe }: RadarPanelProps) {
   const probSeriesRef = useRef<ISeriesApi<'Line'> | null>(null);
   const supportLineRef = useRef<IPriceLine | null>(null);
   const resistanceLineRef = useRef<IPriceLine | null>(null);
+  const vwapLineRef = useRef<IPriceLine | null>(null);
   const entryLineRef = useRef<IPriceLine | null>(null);
   const didFitRef = useRef(false);
 
@@ -157,6 +158,7 @@ export function RadarPanel({ stream, timeframe }: RadarPanelProps) {
       probSeriesRef.current = null;
       supportLineRef.current = null;
       resistanceLineRef.current = null;
+      vwapLineRef.current = null;
       entryLineRef.current = null;
       didFitRef.current = false;
     };
@@ -167,7 +169,7 @@ export function RadarPanel({ stream, timeframe }: RadarPanelProps) {
     didFitRef.current = false;
   }, [timeframe, config.symbol]);
 
-  // Update candle series, probability line, and S/R projections
+  // Update candle series, probability line, and S/R/VWAP projections
   useEffect(() => {
     const candleSeries = candleSeriesRef.current;
     const probSeries = probSeriesRef.current;
@@ -206,7 +208,7 @@ export function RadarPanel({ stream, timeframe }: RadarPanelProps) {
       didFitRef.current = true;
     }
 
-    // Remove and re-apply dynamic horizontal price lines for Next Support / Resistance / Entry
+    // Remove and re-apply dynamic horizontal price lines for Next Support / Resistance / VWAP / Entry
     if (supportLineRef.current) {
       candleSeries.removePriceLine(supportLineRef.current);
       supportLineRef.current = null;
@@ -214,6 +216,10 @@ export function RadarPanel({ stream, timeframe }: RadarPanelProps) {
     if (resistanceLineRef.current) {
       candleSeries.removePriceLine(resistanceLineRef.current);
       resistanceLineRef.current = null;
+    }
+    if (vwapLineRef.current) {
+      candleSeries.removePriceLine(vwapLineRef.current);
+      vwapLineRef.current = null;
     }
     if (entryLineRef.current) {
       candleSeries.removePriceLine(entryLineRef.current);
@@ -238,6 +244,17 @@ export function RadarPanel({ stream, timeframe }: RadarPanelProps) {
       title: 'Next Res',
     });
 
+    if (snapshot.vwap != null && snapshot.vwap > 0) {
+      vwapLineRef.current = candleSeries.createPriceLine({
+        price: snapshot.vwap,
+        color: '#a78bfa',
+        lineWidth: 1,
+        lineStyle: LineStyle.Dotted,
+        axisLabelVisible: true,
+        title: 'VWAP',
+      });
+    }
+
     if (config.entryPrice != null && config.entryPrice > 0) {
       entryLineRef.current = candleSeries.createPriceLine({
         price: config.entryPrice,
@@ -252,6 +269,7 @@ export function RadarPanel({ stream, timeframe }: RadarPanelProps) {
     candles,
     snapshot.predictedNextSupport,
     snapshot.predictedNextResistance,
+    snapshot.vwap,
     config.entryPrice,
     timeframe,
   ]);
@@ -326,7 +344,15 @@ export function RadarPanel({ stream, timeframe }: RadarPanelProps) {
             <span>•</span>
             <span>{snapshot.sampleCount5s}×5s ({snapshot.windowMinutes}m)</span>
             <span>•</span>
-            <span>ATR(5s): {snapshot.atr5s.toFixed(2)}</span>
+            <span>
+              EMA9/21: {snapshot.ema9_1m.toFixed(0)}/{snapshot.ema21_1m.toFixed(0)}
+            </span>
+            {snapshot.vwap != null && (
+              <>
+                <span>•</span>
+                <span style={{ color: '#c4b5fd' }}>VWAP {fmtPrice(snapshot.vwap)}</span>
+              </>
+            )}
           </div>
         </div>
 
@@ -343,7 +369,7 @@ export function RadarPanel({ stream, timeframe }: RadarPanelProps) {
         <div className="prob-labels tabular">
           <span className="text-bull">BULLISH {snapshot.bullishPct}%</span>
           <span style={{ color: 'var(--text-muted)', fontWeight: 500, fontSize: '10px' }}>
-            DYNAMIC LINE: {fmtPrice(snapshot.probLine)}
+            DYNAMIC LINE: {fmtPrice(snapshot.probLine)} · 15m {fmtPrice(snapshot.swing15mLow)}–{fmtPrice(snapshot.swing15mHigh)}
           </span>
           <span className="text-bear">{snapshot.bearishPct}% BEARISH</span>
         </div>
@@ -368,6 +394,12 @@ export function RadarPanel({ stream, timeframe }: RadarPanelProps) {
             <span className="legend-swatch" style={{ background: '#f43f5e' }} />
             Next Res {fmtPrice(snapshot.predictedNextResistance)}
           </span>
+          {snapshot.vwap != null && (
+            <span className="legend-item">
+              <span className="legend-swatch" style={{ background: '#a78bfa' }} />
+              VWAP {fmtPrice(snapshot.vwap)}
+            </span>
+          )}
           {hasEntry && (
             <span className="legend-item">
               <span className="legend-swatch" style={{ background: '#38bdf8' }} />

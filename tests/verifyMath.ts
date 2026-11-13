@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict';
 import {
   aggregateCandles,
+  calcOptionRoundTripCharges,
+  computeConfluenceSignal,
   computeRadarSnapshot,
+  computeSessionVwap,
   runBacktestOn5sCandles,
+  runStrategyBacktest,
 } from '../shared/radarMath.js';
-import type { Candle } from '../shared/types.js';
+import type { Candle, InstrumentConfig, RadarSnapshot, StreamKey } from '../shared/types.js';
 import {
   DhanClient,
   normalizeMarketQuoteResponse,
@@ -302,4 +306,221 @@ assert.equal(ceQuoteTick?.volume, 335340);
 assert.equal(ceQuoteTick?.oi, 232410);
 console.log('✓ Test 7 passed: Dhan REST Quote normalization & IST LTT parsing.');
 
+// 8. Verify FY 2026-27 Dhan + NSE Option Charges (0.15% STT + ₹40 brokerage + NSE/IPFT + Stamp + GST)
+const cheapCost = calcOptionRoundTripCharges(200, 215, 30);
+assert.equal(cheapCost.brokerage, 40);
+assert.equal(cheapCost.stt, Math.round(215 * 30 * 0.0015)); // 10
+assert.ok(cheapCost.totalCharges > 55 && cheapCost.totalCharges < 70);
+assert.ok(cheapCost.breakevenPts > 1.8 && cheapCost.breakevenPts < 2.4);
+
+const expensiveCost = calcOptionRoundTripCharges(1370, 1385, 30);
+assert.equal(expensiveCost.stt, Math.round(1385 * 30 * 0.0015)); // 62
+assert.ok(expensiveCost.totalCharges > 135 && expensiveCost.totalCharges < 155);
+console.log('✓ Test 8 passed: Exact FY 2026-27 Option Charges:', {
+  at200Total: cheapCost.totalCharges,
+  at1370Total: expensiveCost.totalCharges,
+});
+
+// 9. Verify Session VWAP (Option has VWAP, Spot IDX_I has null) & 3-Way Confluence Engine verdicts
+assert.equal(
+  computeSessionVwap([
+    { time: baseSec, open: 100, high: 110, low: 90, close: 100, volume: 0 },
+  ]),
+  null
+);
+const testVwap = computeSessionVwap([
+  { time: baseSec, open: 200, high: 210, low: 190, close: 200, volume: 100 }, // typical = 200
+  { time: baseSec + 60, open: 220, high: 230, low: 210, close: 220, volume: 300 }, // typical = 220
+]);
+assert.equal(testVwap, 215); // (200*100 + 220*300) / 400
+
+assert.equal(bnSnap.vwap, null, 'Spot IDX_I stream must keep vwap = null');
+assert.ok(optSnap.vwap != null && optSnap.vwap > 20, `Option stream must compute VWAP, got ${optSnap.vwap}`);
+assert.ok(bnSnap.ema9_1m > 0 && bnSnap.ema21_1m > 0);
+assert.ok(bnSnap.swing15mHigh >= bnSnap.swing15mLow);
+
+const mockConfigs: Record<StreamKey, InstrumentConfig> = {
+  BANKNIFTY_SPOT: {
+    key: 'BANKNIFTY_SPOT',
+    label: 'Bank Nifty Spot',
+    symbol: 'BANKNIFTY',
+    exchangeSegment: 'IDX_I',
+    securityId: '25',
+    tickSize: 0.05,
+  },
+  NIFTY_SPOT: {
+    key: 'NIFTY_SPOT',
+    label: 'Nifty 50 Spot',
+    symbol: 'NIFTY',
+    exchangeSegment: 'IDX_I',
+    securityId: '13',
+    tickSize: 0.05,
+  },
+  CE_OPTION: {
+    key: 'CE_OPTION',
+    label: '61000 CE',
+    symbol: 'BANKNIFTY 61000 CE',
+    exchangeSegment: 'NSE_FNO',
+    securityId: '1',
+    lots: 1,
+    lotSize: 30,
+    tickSize: 0.05,
+  },
+  PE_OPTION: {
+    key: 'PE_OPTION',
+    label: '61000 PE',
+    symbol: 'BANKNIFTY 61000 PE',
+    exchangeSegment: 'NSE_FNO',
+    securityId: '2',
+    lots: 1,
+    lotSize: 30,
+    tickSize: 0.05,
+  },
+};
+
+const mkSnap = (
+  key: StreamKey,
+  over: Partial<RadarSnapshot>
+): RadarSnapshot => ({
+  ...bnSnap,
+  key,
+  ...over,
+});
+
+const ceReadyConf = computeConfluenceSignal({
+  configs: mockConfigs,
+  snapshots: {
+    BANKNIFTY_SPOT: mkSnap('BANKNIFTY_SPOT', {
+      ltp: 61085,
+      probLine: 61040,
+      ema9_1m: 61065,
+      ema21_1m: 61030,
+      swing15mLow: 61000,
+      swing15mHigh: 61090,
+      atr1m: 18,
+      bullishPct: 64,
+    }),
+    NIFTY_SPOT: mkSnap('NIFTY_SPOT', {
+      ltp: 25660,
+      probLine: 25645,
+      atr1m: 8,
+      bullishPct: 58,
+    }),
+    CE_OPTION: mkSnap('CE_OPTION', {
+      ltp: 310,
+      probLine: 298,
+      vwap: 295,
+      ema9_1m: 304,
+      ema21_1m: 292,
+      swing15mLow: 280,
+      swing15mHigh: 315,
+      predictedNextResistance: 325,
+      atr1m: 6.5,
+      lowDev1m: 3.5,
+      bullishPct: 66,
+    }),
+    PE_OPTION: mkSnap('PE_OPTION', {
+      ltp: 280,
+      probLine: 295,
+      vwap: 305,
+      ema9_1m: 286,
+      ema21_1m: 299,
+      swing15mLow: 278,
+      swing15mHigh: 312,
+      predictedNextResistance: 288,
+      atr1m: 5.5,
+      lowDev1m: -4.2,
+      bullishPct: 35,
+    }),
+  },
+});
+assert.equal(ceReadyConf.verdict, 'A_PLUS_CE', `Expected A_PLUS_CE, got ${ceReadyConf.verdict}`);
+assert.equal(ceReadyConf.suggestedAtmStrike, 61100);
+
+const chopConf = computeConfluenceSignal({
+  configs: mockConfigs,
+  snapshots: {
+    BANKNIFTY_SPOT: mkSnap('BANKNIFTY_SPOT', {
+      ltp: 61040,
+      probLine: 61042,
+      ema9_1m: 61039,
+      ema21_1m: 61041,
+      swing15mLow: 61030,
+      swing15mHigh: 61048,
+      atr1m: 22,
+      bullishPct: 49,
+    }),
+    NIFTY_SPOT: mkSnap('NIFTY_SPOT', {
+      ltp: 25640,
+      probLine: 25644,
+      atr1m: 8,
+      bullishPct: 48,
+    }),
+    CE_OPTION: mkSnap('CE_OPTION', {
+      ltp: 300,
+      probLine: 303,
+      vwap: 310,
+      ema9_1m: 299,
+      ema21_1m: 305,
+      swing15mLow: 296,
+      swing15mHigh: 308,
+      predictedNextResistance: 302,
+      atr1m: 1.5,
+      lowDev1m: -1.5,
+      bullishPct: 46,
+    }),
+    PE_OPTION: mkSnap('PE_OPTION', {
+      ltp: 295,
+      probLine: 298,
+      vwap: 304,
+      ema9_1m: 294,
+      ema21_1m: 299,
+      swing15mLow: 291,
+      swing15mHigh: 301,
+      predictedNextResistance: 297,
+      atr1m: 1.4,
+      lowDev1m: -1.0,
+      bullishPct: 47,
+    }),
+  },
+});
+assert.equal(chopConf.verdict, 'CHOP_WAIT', `Expected CHOP_WAIT on sideways chop, got ${chopConf.verdict}`);
+console.log('✓ Test 9 passed: Session VWAP & 3-Way Confluence Engine verdicts (A+ CE vs CHOP WAIT).');
+
+// 10. Verify Net-of-Tax Strategy Backtester on 45-minute Simulator streams
+const seeded45 = sim.seedHistory('BEARISH_BREAKDOWN', 61300, 61300, 45);
+const stratSummary = runStrategyBacktest({
+  params: {
+    optionKey: 'PE_OPTION',
+    strategy: 'STRONG_CONFLUENCE',
+    lots: 1,
+    maxTrades: 6,
+    cooldownMinutes: 4,
+    minCostMult: 3.0,
+    slAtrMult: 1.5,
+    trailingEnabled: true,
+    stdDevMultiplier: 1.0,
+  },
+  symbol: 'BANKNIFTY 61300 PE',
+  lotSize: 30,
+  tickSize: 0.05,
+  dataSourceLabel: 'Simulator 45m Test',
+  bnBars1m: aggregateCandles(seeded45.candlesByStream.BANKNIFTY_SPOT, '1m'),
+  nfBars1m: aggregateCandles(seeded45.candlesByStream.NIFTY_SPOT, '1m'),
+  optBars1m: aggregateCandles(seeded45.candlesByStream.PE_OPTION, '1m'),
+});
+assert.ok(stratSummary.barsEvaluated >= 40);
+assert.equal(
+  Math.round((stratSummary.grossPnlRs - stratSummary.totalChargesRs) * 100),
+  Math.round(stratSummary.netPnlRs * 100),
+  'Net P&L must equal Gross - FY26-27 Charges'
+);
+assert.ok(stratSummary.comparison !== undefined);
+console.log('✓ Test 10 passed: Net-of-Tax Strategy Backtester:', {
+  bars: stratSummary.barsEvaluated,
+  strongTrades: stratSummary.tradeCount,
+  strongNetRs: stratSummary.netPnlRs,
+  naiveTrades: stratSummary.comparison?.naiveTrades,
+  naiveNetRs: stratSummary.comparison?.naiveNetRs,
+});
 

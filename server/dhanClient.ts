@@ -415,33 +415,50 @@ export class DhanClient extends EventEmitter {
     const toDate = `${todayIst} 15:30:00`;
 
     try {
-      const res = await fetch('https://api.dhan.co/v2/charts/intraday', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'access-token': this.credentials.accessToken,
-          'client-id': this.credentials.clientId,
-        },
-        body: JSON.stringify({
-          securityId: params.securityId,
-          exchangeSegment: params.exchangeSegment,
-          instrument: params.instrument,
-          interval: '1',
-          oi: false,
-          fromDate,
-          toDate,
-        }),
-      });
-      if (!res.ok) return [];
-
-      const json = (await res.json()) as {
+      let json: {
         timestamp?: number[];
         open?: number[];
         high?: number[];
         low?: number[];
         close?: number[];
         volume?: number[];
-      };
+      } | null = null;
+
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const res = await fetch('https://api.dhan.co/v2/charts/intraday', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'access-token': this.credentials.accessToken,
+            'client-id': this.credentials.clientId,
+          },
+          body: JSON.stringify({
+            securityId: params.securityId,
+            exchangeSegment: params.exchangeSegment,
+            instrument: params.instrument,
+            interval: '1',
+            oi: false,
+            fromDate,
+            toDate,
+          }),
+        });
+        if (res.status === 429 && attempt < 2) {
+          await new Promise((resolve) => setTimeout(resolve, 300 * (attempt + 1)));
+          continue;
+        }
+        if (!res.ok) return [];
+        json = (await res.json()) as {
+          timestamp?: number[];
+          open?: number[];
+          high?: number[];
+          low?: number[];
+          close?: number[];
+          volume?: number[];
+        };
+        break;
+      }
+
+      if (!json) return [];
 
       const ts = json.timestamp;
       if (!Array.isArray(ts) || ts.length === 0) return [];

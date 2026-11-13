@@ -70,8 +70,13 @@ export interface RadarSnapshot {
   highDev1m: number;
   avgLowDev1m: number;
   stdDevLow1m: number;
-  // Dynamic probability line & combined %
+  // Dynamic probability line, EMAs, VWAP & 15m structure
   probLine: number;
+  ema9_1m: number;
+  ema21_1m: number;
+  vwap: number | null;
+  swing15mHigh: number;
+  swing15mLow: number;
   bullishPct: number;
   bearishPct: number;
   regime: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
@@ -98,6 +103,119 @@ export interface RadarSnapshot {
     bearishPct: number;
     lowDev1m: number;
   } | null;
+}
+
+export type ConfluenceVerdict =
+  | 'A_PLUS_CE'
+  | 'A_PLUS_PE'
+  | 'WATCH_CE'
+  | 'WATCH_PE'
+  | 'CHOP_WAIT';
+
+export interface ConfluenceCheckItem {
+  id: 'BN_SPOT' | 'NIFTY_SYNC' | 'OPTION_VWAP' | 'STRUCTURE_15M' | 'COST_EDGE';
+  label: string;
+  passed: boolean;
+  detail: string;
+}
+
+export interface ConfluenceSideEvaluation {
+  optionType: 'CE' | 'PE';
+  symbol: string;
+  ltp: number;
+  score: number;
+  passed: boolean;
+  estCostRs: number;
+  breakevenPts: number;
+  expectedRoomPts: number;
+  rewardToCostRatio: number;
+  checks: ConfluenceCheckItem[];
+}
+
+export interface ConfluenceSignal {
+  verdict: ConfluenceVerdict;
+  direction: 'CE' | 'PE' | 'NONE';
+  headline: string;
+  subline: string;
+  activeScore: number;
+  suggestedAtmStrike: number;
+  ceEval: ConfluenceSideEvaluation;
+  peEval: ConfluenceSideEvaluation;
+}
+
+export type StrategyPreset = 'NAIVE_SR' | 'TREND_SR' | 'STRONG_CONFLUENCE';
+
+export interface OptionChargeBreakdown {
+  brokerage: number;
+  stt: number;
+  exchTxnIpft: number;
+  sebiFee: number;
+  stampDuty: number;
+  gst: number;
+  totalCharges: number;
+  breakevenPts: number;
+}
+
+export interface StrategyBacktestParams {
+  optionKey: 'CE_OPTION' | 'PE_OPTION';
+  strategy: StrategyPreset;
+  lots: number;
+  maxTrades: number;
+  cooldownMinutes: number;
+  minCostMult: number;
+  slAtrMult: number;
+  trailingEnabled: boolean;
+  stdDevMultiplier: number;
+  source?: 'AUTO' | '5S_TICKS';
+}
+
+export interface SimulatedTradeRow {
+  id: number;
+  entryTimeSec: number;
+  exitTimeSec: number;
+  entryTime: string;
+  exitTime: string;
+  entryPrice: number;
+  exitPrice: number;
+  pnlPts: number;
+  reason: 'TARGET_RES' | 'TRAILING_SL' | 'STOP_LOSS' | 'TREND_EXIT' | 'MARK_TO_MKT';
+  grossRs: number;
+  chargesRs: number;
+  sttRs: number;
+  netRs: number;
+  note: string;
+}
+
+export interface StrategyBacktestSummary {
+  optionKey: 'CE_OPTION' | 'PE_OPTION';
+  symbol: string;
+  strategy: StrategyPreset;
+  dataSourceLabel: string;
+  barsEvaluated: number;
+  sessionStartIst: string;
+  sessionEndIst: string;
+  qty: number;
+  tradeCount: number;
+  winCount: number;
+  lossCount: number;
+  winRatePct: number;
+  grossPnlRs: number;
+  totalChargesRs: number;
+  totalSttRs: number;
+  netPnlRs: number;
+  avgChargePerTradeRs: number;
+  maxDrawdownRs: number;
+  trades: SimulatedTradeRow[];
+  comparison?: {
+    naiveTrades: number;
+    naiveGrossRs: number;
+    naiveChargesRs: number;
+    naiveNetRs: number;
+    strongTrades: number;
+    strongGrossRs: number;
+    strongChargesRs: number;
+    strongNetRs: number;
+  };
 }
 
 export interface ForecastRecord {
@@ -173,6 +291,7 @@ export interface RadarBroadcast {
   serverTimeMs: number;
   dhanStatus: DhanStatus;
   settings: RadarSettings;
+  confluence: ConfluenceSignal;
   streams: Record<StreamKey, StreamPayload>;
 }
 

@@ -3,6 +3,8 @@ import type {
   BacktestSummary,
   RadarBroadcast,
   RadarSettings,
+  StrategyBacktestParams,
+  StrategyBacktestSummary,
   StreamKey,
 } from '../../shared/types.js';
 
@@ -102,6 +104,17 @@ export function useRadarSocket() {
     return next;
   }, []);
 
+  const snapToAtm = useCallback(async (): Promise<{ atmStrike: number; state: RadarBroadcast }> => {
+    const res = await fetch('/api/strikes/snap-atm', { method: 'POST' });
+    if (!res.ok) {
+      const body = (await res.json().catch(() => ({}))) as { error?: string };
+      throw new Error(body.error || 'Failed to snap to ATM');
+    }
+    const data = (await res.json()) as { atmStrike: number; state: RadarBroadcast };
+    setState(data.state);
+    return data;
+  }, []);
+
   const reseedScenario = useCallback(async (scenario?: RadarSettings['simScenario']) => {
     const res = await fetch('/api/simulator/reseed', {
       method: 'POST',
@@ -152,6 +165,27 @@ export function useRadarSocket() {
     []
   );
 
+  const runStrategyBacktest = useCallback(
+    async (params: StrategyBacktestParams): Promise<StrategyBacktestSummary> => {
+      const qs = new URLSearchParams({
+        optionKey: params.optionKey,
+        strategy: params.strategy,
+        lots: String(params.lots),
+        maxTrades: String(params.maxTrades),
+        cooldownMinutes: String(params.cooldownMinutes),
+        minCostMult: String(params.minCostMult),
+        slAtrMult: String(params.slAtrMult),
+        trailingEnabled: String(params.trailingEnabled),
+        stdDevMultiplier: String(params.stdDevMultiplier),
+        source: params.source ?? 'AUTO',
+      });
+      const res = await fetch(`/api/strategy-backtest?${qs.toString()}`);
+      if (!res.ok) throw new Error('Strategy backtest failed');
+      return (await res.json()) as StrategyBacktestSummary;
+    },
+    []
+  );
+
   const fetchExpiries = useCallback(async (): Promise<string[]> => {
     const res = await fetch('/api/dhan/expiries');
     if (!res.ok) return [];
@@ -164,10 +198,12 @@ export function useRadarSocket() {
     connected,
     error,
     updateSettings,
+    snapToAtm,
     reseedScenario,
     connectDhanLive,
     disconnectDhanLive,
     runBacktest,
+    runStrategyBacktest,
     fetchExpiries,
   };
 }
