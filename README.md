@@ -24,7 +24,19 @@ npm run build
 npm start
 ```
 
-## Google Cloud Run (Always-On Collector)
+## Vultr Cloud Compute (24×7 Always-On Mumbai Server — Recommended)
+
+1. Open **https://console.vultr.com/deploy/**
+2. Choose **Cloud Compute - Shared CPU** → Location: **Mumbai** → Image: **Ubuntu 24.04 LTS x64** (or **Docker** Marketplace App) → Plan: **1 vCPU / 1 GB or 2 GB RAM**.
+3. SSH into your new Vultr server (or paste [`deploy-vultr.sh`](file:///home/antigravity/banknifty-radar/deploy-vultr.sh) as a Vultr **Startup Script**) and run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ankitvyas19-blip/banknifty-5s-radar/main/deploy-vultr.sh | sudo bash
+```
+
+4. Open `http://<YOUR_VULTR_IP>` in your browser and connect your DhanHQ Client ID & Access Token once — it is persisted in `/opt/banknifty-radar/data/radar.sqlite` so the server never drops back to `SIMULATOR` on restart.
+
+## Google Cloud Run (Alternative)
 
 ```bash
 gcloud run deploy banknifty-5s-radar \

@@ -145,8 +145,17 @@ export class EngineManager extends EventEmitter {
       this.emit('broadcast', this.getFullBroadcast('TICK_UPDATE'));
     });
 
-    // If DHAN env vars are provided & DHAN_AUTO_CONNECT=true, auto-connect
-    if (this.dhan.hasCredentials() && process.env.DHAN_AUTO_CONNECT === 'true') {
+    // Restore persisted Dhan credentials from SQLite if not explicitly overridden by env vars
+    const savedSession = this.store.loadDhanSession();
+    if (!this.dhan.hasCredentials() && savedSession?.clientId && savedSession?.accessToken) {
+      this.dhan.setCredentials(savedSession.clientId, savedSession.accessToken);
+    }
+
+    const shouldAutoConnect =
+      this.dhan.hasCredentials() &&
+      (process.env.DHAN_AUTO_CONNECT === 'true' || savedSession?.autoConnect === true);
+
+    if (shouldAutoConnect) {
       this.connectPromise = this.connectDhanLive()
         .catch((err) => {
           console.error('[BankNifty 5s Radar] Initial Dhan auto-connect error:', err);
@@ -716,6 +725,20 @@ export class EngineManager extends EventEmitter {
       throw new Error('Please provide both Dhan Client ID and Access Token.');
     }
 
+    const activeCreds = this.dhan.getCredentialsForPersistence();
+    if (activeCreds) {
+      try {
+        this.store.saveDhanSession({
+          autoConnect: true,
+          clientId: activeCreds.clientId,
+          accessToken: activeCreds.accessToken,
+          updatedAt: Date.now(),
+        });
+      } catch (err) {
+        console.error('[BankNifty 5s Radar] Failed to save Dhan session to SQLite:', err);
+      }
+    }
+
     const runConnect = async (): Promise<DhanStatus> => {
       this.mode = 'DHAN_LIVE';
       this.stopSimulatorLoop();
@@ -790,6 +813,17 @@ export class EngineManager extends EventEmitter {
     this.clearLiveFlushTimer();
     this.dhan.disconnect(true);
     this.mode = 'SIMULATOR';
+    const activeCreds = this.dhan.getCredentialsForPersistence();
+    try {
+      this.store.saveDhanSession({
+        autoConnect: false,
+        clientId: activeCreds?.clientId,
+        accessToken: activeCreds?.accessToken,
+        updatedAt: Date.now(),
+      });
+    } catch {
+      // ignore sqlite write warning
+    }
     this.lastSeenCumVolume = {};
     this.configs = this.buildInstrumentConfigs();
     this.seedSimulatorHistory(this.settings.simScenario);

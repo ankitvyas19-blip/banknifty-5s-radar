@@ -5,6 +5,13 @@ import type { Candle, ForecastRecord, RadarSettings, StreamKey } from '../shared
 
 const DEFAULT_DATA_DIR = process.env.RADAR_DATA_DIR || path.resolve(process.cwd(), 'data');
 
+export interface StoredDhanSession {
+  autoConnect: boolean;
+  clientId?: string;
+  accessToken?: string;
+  updatedAt?: number;
+}
+
 export class RadarStore {
   private db: DatabaseSync;
   public readonly dbPath: string;
@@ -93,6 +100,26 @@ export class RadarStore {
     if (!row?.value) return null;
     try {
       return JSON.parse(row.value) as Partial<RadarSettings>;
+    } catch {
+      return null;
+    }
+  }
+
+  public saveDhanSession(session: StoredDhanSession): void {
+    const stmt = this.db.prepare(`
+      INSERT INTO kv_state (key, value, updated_at)
+      VALUES ('dhan_session', ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    `);
+    stmt.run(JSON.stringify(session), Date.now());
+  }
+
+  public loadDhanSession(): StoredDhanSession | null {
+    const stmt = this.db.prepare(`SELECT value FROM kv_state WHERE key = 'dhan_session'`);
+    const row = stmt.get() as { value?: string } | undefined;
+    if (!row?.value) return null;
+    try {
+      return JSON.parse(row.value) as StoredDhanSession;
     } catch {
       return null;
     }

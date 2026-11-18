@@ -1,0 +1,24 @@
+services:
+  banknifty-5s-radar:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: banknifty-5s-radar
+    restart: unless-stopped
+    ports:
+      - "80:8080"
+      - "8080:8080"
+    environment:
+      - NODE_ENV=production
+      - PORT=8080
+      - RADAR_DATA_DIR=/app/data
+      - DHAN_AUTO_CONNECT=${DHAN_AUTO_CONNECT:-true}
+      - DHAN_CLIENT_ID=${DHAN_CLIENT_ID:-}
+      - DHAN_ACCESS_TOKEN=${DHAN_ACCESS_TOKEN:-}
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 20s
+      timeout: 5s
+      retries: 3

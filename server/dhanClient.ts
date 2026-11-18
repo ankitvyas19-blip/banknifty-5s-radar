@@ -228,6 +228,10 @@ export class DhanClient extends EventEmitter {
     this.lastError = null;
   }
 
+  public getCredentialsForPersistence(): DhanCredentials | null {
+    return this.credentials ? { ...this.credentials } : null;
+  }
+
   /**
    * Loads BANKNIFTY OPTIDX contracts from Dhan's NSE_FNO instrument CSV using a streaming reader
    * so the 16MB CSV is never retained in V8 heap memory.

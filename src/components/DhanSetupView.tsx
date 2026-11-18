@@ -201,34 +201,28 @@ export function DhanSetupView({
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px' }}>
           <Cloud size={16} className="text-ice" />
           <h2 style={{ margin: 0, fontSize: '15px' }}>
-            24×7 Google Cloud Run Deployment (Always-On Collector)
+            24×7 Vultr Mumbai Deployment (Always-On Persistent Server)
           </h2>
         </div>
 
         <p style={{ fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '12px' }}>
-          Because DhanHQ Historical Intraday API only serves 1m+ candles (not 5s candles), running
-          this container on <strong>Google Cloud Run</strong> with <code>--min-instances=1</code>{' '}
-          keeps the Dhan WebSocket alive even when your laptop is closed, continuously recording 5s
-          bars and <code>:55s</code> forecasts into SQLite/Cloud Storage for instant Backtesting.
+          Running on <strong>Vultr Cloud Compute (Mumbai)</strong> keeps a dedicated 24×7 container
+          alive with persistent disk storage (<code>/opt/banknifty-radar/data/radar.sqlite</code>).
+          Once you connect your DhanHQ token above, it is saved in SQLite and automatically
+          reconnects in <code>DHAN_LIVE</code> mode even if the server restarts.
         </p>
 
-        <pre className="code-block">{`# 1. Build & deploy to Google Cloud Run (Mumbai asia-south1 for lowest NSE latency)
-gcloud run deploy banknifty-5s-radar \\
-  --source . \\
-  --region asia-south1 \\
-  --platform managed \\
-  --allow-unauthenticated \\
-  --min-instances 1 \\
-  --max-instances 1 \\
-  --no-cpu-throttling \\
-  --set-env-vars "NODE_ENV=production,DHAN_AUTO_CONNECT=true" \\
-  --set-secrets "DHAN_CLIENT_ID=dhan-client-id:latest,DHAN_ACCESS_TOKEN=dhan-token:latest"`}</pre>
+        <pre className="code-block">{`# Run on your Vultr Ubuntu server (or paste deploy-vultr.sh as a Vultr Startup Script):
+curl -fsSL https://raw.githubusercontent.com/ankitvyas19-blip/banknifty-5s-radar/main/deploy-vultr.sh | sudo bash
+
+# Or update an existing Vultr server manually:
+cd /opt/banknifty-radar && git pull && docker compose up -d --build`}</pre>
 
         <p style={{ fontSize: '11.5px', color: 'var(--text-muted)', marginTop: '12px' }}>
-          Tip: Add <code>--no-cpu-throttling</code> so Node continues aggregating 5-second candles and
-          evaluating <code>:50s / :55s</code> forecasts even when no browser tab is open. Mount a GCS
-          FUSE bucket at <code>/app/data</code> (<code>RADAR_DATA_DIR=/app/data</code>) to preserve
-          SQLite history across container restarts.
+          Tip: Choose <strong>Mumbai</strong> location on{' '}
+          <code>https://console.vultr.com/deploy/</code> (Ubuntu 24.04, 1 vCPU / 1–2 GB RAM). Port{' '}
+          <code>80</code> and <code>8080</code> are both mapped automatically so you can open{' '}
+          <code>http://&lt;VULTR_IP&gt;</code> directly.
         </p>
       </div>
     </div>
